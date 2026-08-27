@@ -1,30 +1,37 @@
 # Facebook research collector
 
-Browser-assisted, bounded collection of Facebook group posts and visible comments for MoneyFlow research.
+Browser-assisted collection of Facebook research evidence for MoneyFlow. The collector is designed to minimize repeated work across research topics while preserving provenance and explicit completeness limits.
 
-This tool is intentionally **not** a stealth scraper. It does not bypass Facebook authentication, checkpoints, rate limits, privacy controls, anti-bot controls, or deleted/hidden content. Use it only for content you are allowed to access and in a way that complies with Meta's terms and applicable law.
+It is intentionally **not** a stealth scraper. It does not bypass authentication, checkpoints, rate limits, privacy controls, anti-bot controls, or deleted/hidden content. Use it only for content the signed-in account is legitimately allowed to view and stop if Facebook blocks automated activity.
 
-## Why this exists
+## v0.3 pipeline
 
-The collector separates a cheap discovery pass from a more expensive collection pass:
+The default `npm run collect` path now separates discovery, cheap full-body classification, corpus reuse, and expensive comment collection:
 
 ```text
-Facebook group search
-  -> candidate permalink + preview
-  -> deterministic relevance score
-  -> only relevant posts opened
-  -> expand visible comments/replies
-  -> local raw evidence
-  -> normalized JSON + Markdown
+Facebook discovery
+  -> candidate post identity
+  -> persistent corpus lookup
+       -> known body/complete post: reuse local evidence
+       -> unseen post: open once for full-body preflight
+  -> full-body topic classification
+       -> in-topic / adjacent / ambiguous: comment collection eligible
+       -> out-of-topic: body-only exclusion evidence
+  -> exact previously-complete post: reuse normalized post/comments
+  -> new eligible post: deep comment/reply collection
+  -> exact-content / near-content fingerprint flag
+  -> local corpus index + normalized cache update
 ```
 
-This avoids manually copying every post while keeping selection explainable. It also avoids committing Facebook source dumps to the public research repository.
+The corpus layer is deliberately cross-topic. If the same Facebook post appears in later searches, the collector records the new query provenance but does not re-fetch its comment tree when a compatible complete normalized record already exists.
+
+Near-duplicate **content is not automatically discarded**. Reposts/cross-posts can have different discussion threads, so SimHash/Hamming-distance matches are recorded as review metadata only. Exact Facebook source identity is the hard reuse boundary.
 
 ## Requirements
 
 - Node.js 20+
-- a Facebook account that can legitimately view the target content
 - Chromium installed through Playwright
+- a Facebook account that can legitimately view the target content
 
 Current pinned Playwright version: `1.62.1`.
 
@@ -37,7 +44,7 @@ npx playwright install chromium
 cp config.example.json config.json
 ```
 
-Edit `config.json` with the group, search queries, relevance rules and collection limits.
+Edit `config.json` for the current discovery surface/query set, full-body filter rules, and local corpus paths.
 
 ## Login once
 
@@ -45,71 +52,121 @@ Edit `config.json` with the group, search queries, relevance rules and collectio
 npm run login -- --config config.json
 ```
 
-A headed browser opens. Log in yourself, then return to the terminal and press Enter. The browser profile is stored locally under `profile/` and is gitignored.
+A headed browser opens. Log in yourself, then return to the terminal and press Enter. The browser profile stays under local `profile/` and is gitignored.
 
-Do not put Facebook passwords, cookies, access tokens or exported browser state in this repository.
+Never put Facebook passwords, cookies, access tokens, or exported browser state in this repository.
 
-## Collect
+## Seed the corpus from an existing run
 
-```bash
-npm run collect -- --config config.json
-```
-
-For a smaller test:
+Before researching the next topic, import prior normalized runs so already-complete posts are reusable immediately:
 
 ```bash
-npm run collect -- --config config.json --limit 3
+npm run corpus:import -- \
+  --config config.json \
+  --from-run output/2026-08-27T19-01-01-462Z
 ```
 
-Output is local and gitignored:
+`--from-run` accepts either a run directory or its `dataset.json` file.
+
+The importer:
+
+- indexes full normalized post bodies;
+- caches compatible strict-complete normalized post/comment records;
+- uses the final collected Facebook URL when available to repair old group-alias/provenance ambiguity;
+- does not make old incomplete/older-acceptance records reusable as complete evidence.
+
+## Collect a topic
+
+```bash
+npm run collect -- --config config.json --query "quản lý chi tiêu"
+```
+
+Use a prior discovery artifact without rediscovering:
+
+```bash
+npm run collect -- \
+  --config config.json \
+  --from-discovery output/<run>/discovery.json
+```
+
+Important v0.3 options:
 
 ```text
-output/<run-timestamp>/
-  discovery.json
-  dataset.json
-  RUN.json
+--corpus-index <path>   Override local corpus index path
+--recollect-known       Ignore complete-record reuse and collect eligible known posts again
+--ignore-corpus         Run without reading/writing the persistent corpus
+--skip-topic-filter     Disable the full-body gate for a diagnostic run
+```
+
+Legacy deep collector behavior remains available for debugging:
+
+```bash
+npm run collect:legacy -- --config config.json ...
+```
+
+## Full-body filter
+
+Preview text is not reliable enough to decide topic relevance. v0.3 therefore uses preview scoring only as discovery metadata and performs a conservative full-post-body gate before expanding comments.
+
+Classification states:
+
+- `in-topic`: strong evidence for the current topic;
+- `adjacent`: useful neighboring mechanism/market evidence;
+- `ambiguous`: insufficient evidence to safely exclude;
+- `out-of-topic`: obvious search noise; keep body/provenance locally but do not pay the cost of expanding the comment tree.
+
+The default PFM rules in `config.example.json` were calibrated against the collected 69-post `quản lý chi tiêu` audit. On that fixed audit they would retain all 13 manually audited core PFM threads while excluding 37 obvious out-of-topic posts before expensive comment expansion. That is a **regression/calibration result, not a claim about Facebook search precision or Vietnamese market prevalence**.
+
+Prefer recall over aggressive exclusion. If uncertain, classify `ambiguous` and collect the discussion.
+
+## Persistent corpus and deduplication
+
+Local files are gitignored:
+
+```text
+corpus/
+  index.json
+  posts/
+    <source-key-hash>.json
+```
+
+`index.json` stores source/query provenance, body fingerprints, acceptance version, cache references, and per-topic classification metadata. Normalized cache records let a later topic reuse a previously collected post without reopening its full comment tree.
+
+Deduplication rules:
+
+1. same exact corpus/source identity -> reuse when strict-complete and acceptance-compatible;
+2. same unique Facebook post ID under an alias -> reuse the one known record;
+3. same normalized body SHA-256 but different source identity -> flag `exact-content`, do not drop;
+4. close 64-bit SimHash/Hamming match -> flag `near-content`, do not drop;
+5. different post/source identities remain separate evidence unless a human/research rule explicitly decides otherwise.
+
+This prevents repeated scraping across topics without collapsing distinct discussions that happen to quote/repost the same text.
+
+## Output
+
+The wrapper keeps the normal local evidence and adds topic-processing artifacts:
+
+```text
+output/<run>/
+  discovery.json              # discovery source artifact when produced by this run
+  discovery.filtered.json     # only candidates eligible for new deep collection
+  preflight.json              # full-body classifications/dispositions
+  exclusions.json             # local body-only out-of-topic evidence
+  collection-reconciliation.json
+  reconciliation.json         # final fetched/reused/excluded accounting
+  dataset.json                # relevant complete records, including corpus reuse
+  TOPIC_RUN.json
   raw/
-    <post-id>.json
   normalized/
-    <post-id>.json
-    <post-id>.md
 ```
 
-`raw/` preserves a bounded post subtree snapshot so parser mistakes can be checked later. `normalized/` stores post/comment blocks, source URLs, hierarchy fingerprints and relevance evidence.
+Raw/source dumps, normalized datasets, profile state, config, and corpus cache remain local and are not committed to the public research repository.
 
-## How selection works
+## Completeness semantics
 
-Discovery extracts only Facebook group URLs shaped like:
+Deep comment extraction remains best-effort because Facebook ranking, privacy, lazy loading, deleted content, UI experiments, and account-specific visibility can hide material.
 
-- `/groups/<group>/posts/<post-id>`
-- `/groups/<group>/permalink/<post-id>`
-- group URLs with `multi_permalinks=<post-id>`
-
-All variants are canonicalized to one key:
-
-```text
-facebook:<group-id-or-slug>:<post-id>
-```
-
-The preview is scored using weighted `include` and `exclude` terms in `config.json`. Vietnamese matching is accent-insensitive. This is deliberately deterministic in v1: the run can explain exactly why a post passed the threshold, and no external AI API receives Facebook content.
-
-A later research step may analyze the resulting local dataset, but that is separate from source collection.
-
-## Comment extraction
-
-Facebook changes its DOM often. The collector therefore prefers user-facing/accessibility contracts and only uses generic structural hints such as `role="article"` rather than generated CSS class names. It attempts to click visible controls whose text matches common Vietnamese/English forms of:
-
-- Xem thêm / See more
-- Xem thêm bình luận / View more comments
-- Xem thêm phản hồi / View more replies
-
-It then treats nested `role="article"` blocks as comment/reply candidates and records the DOM nesting relationship.
-
-This is **best effort**, not a guarantee of every comment. Facebook ranking, privacy, lazy loading, deleted content, UI experiments and account-specific visibility can make the visible set incomplete.
-
-## Data hygiene
-
-Do not commit the generated `profile/`, `output/` or `config.json` directories/files. The repository's durable research records should contain summaries, short quotations when necessary, canonical source links, applicability limits and verification notes—not copyrighted Facebook dumps or private participant data.
+A strict-complete post is reusable only when its accepted collector version confirms the required comment-sort, bottom-convergence, scroll-surface, and residual-expand-control invariants. Older records can still provide body text for classification but must be re-collected before being treated as compatible complete comment evidence.
 
 ## Tests
 
@@ -117,12 +174,13 @@ Do not commit the generated `profile/`, `output/` or `config.json` directories/f
 npm test
 ```
 
-The tests cover permalink canonicalization, relevance scoring, conservative UI-noise cleanup and deterministic comment fingerprints without needing Facebook or a logged-in browser.
+Coverage includes URL/comment parsing, UI cleanup, strict CLI behavior, corpus reuse by source/post identity, local atomic registry/cache round-trips, SimHash near-duplicate flagging, and full-body topic filtering.
 
-## Failure modes to expect
+## Failure modes
 
-- Facebook asks for login/checkpoint again: rerun `npm run login` and complete it manually.
-- Search UI changes: discovery may return zero candidates; inspect the page manually before changing selectors.
-- Comment controls change language/text: update the bounded expansion regex rather than adding brittle generated CSS selectors.
-- A post has ranked/hidden comments: record the collection as incomplete; do not claim exhaustiveness.
-- Facebook blocks automated activity: stop. Do not add stealth plugins, fingerprint spoofing, CAPTCHA bypasses or rate-limit evasion.
+- Facebook asks for login/checkpoint: complete login manually; do not automate around it.
+- Facebook blocks automated activity: stop; do not add stealth/fingerprint/CAPTCHA/rate-limit bypasses.
+- Search UI changes: discovery may return zero/noisy candidates; preserve diagnostics and inspect the UI before changing selectors.
+- Topic filter becomes too aggressive: use `--skip-topic-filter` for diagnosis and update rules against a reviewed corpus; do not silently drop ambiguous posts.
+- Corpus cache is missing/corrupt: fail visibly or re-import/recollect; never pretend an absent cache is reusable complete evidence.
+- A post has ranked/hidden comments: record the limitation; do not claim global Facebook exhaustiveness.
