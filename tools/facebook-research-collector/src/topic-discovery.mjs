@@ -83,6 +83,21 @@ function permalinkLikelihood(link) {
   return score;
 }
 
+function highlightKind(href = '') {
+  try {
+    const url = new URL(href, 'https://www.facebook.com');
+    if (url.searchParams.has('reply_comment_id')) return 'reply-comment-highlight';
+    if (url.searchParams.has('comment_id')) return 'comment-highlight';
+  } catch {}
+  return 'clean-post-link';
+}
+
+function highlightPenalty(kind) {
+  if (kind === 'reply-comment-highlight') return -3;
+  if (kind === 'comment-highlight') return -1;
+  return 0;
+}
+
 async function extractSearchResultCards(page) {
   return page.evaluate(() => {
     const visible = (el) => Boolean(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
@@ -99,14 +114,33 @@ async function extractSearchResultCards(page) {
   });
 }
 
-function selectCardPost(card) {
+/**
+ * Select the Facebook post represented by one global/group search result card.
+ *
+ * Global Posts search can render the post timestamp as a URL whose PATH is the
+ * real /groups/<group>/posts/<postId> identity while the query string contains
+ * ?comment_id=... to highlight a matching comment. That query parameter is
+ * discovery provenance, not source identity. Accept it here, canonicalize from
+ * the path via parseFacebookPostIdentity(), and prefer a clean post link when
+ * the same card happens to expose both forms.
+ *
+ * Important: this rule is discovery-only. Post-root extraction still rejects
+ * comment/reply permalinks as root-selection evidence.
+ */
+export function selectCardPost(card) {
   const byIdentity = new Map();
   for (const link of card.links ?? []) {
-    if (!link.href || link.href.includes('comment_id=') || link.href.includes('reply_comment_id=')) continue;
+    if (!link.href) continue;
     const identity = parseFacebookPostIdentity(link.href);
     if (!identity?.postId || !identity?.groupIdentifier) continue;
+    const kind = highlightKind(link.href);
     const existing = byIdentity.get(identity.key);
-    const candidate = { identity, link, score: permalinkLikelihood(link) };
+    const candidate = {
+      identity,
+      link,
+      sourceLinkKind: kind,
+      score: permalinkLikelihood(link) + highlightPenalty(kind),
+    };
     if (!existing || candidate.score > existing.score) byIdentity.set(identity.key, candidate);
   }
   const ranked = [...byIdentity.values()].sort((a, b) => b.score - a.score);
@@ -145,6 +179,7 @@ async function discoverQuery(page, config, query, globalCandidates) {
   let stableBottom = 0;
   let previousHeight = 0;
   let completionReason = 'safety-cap';
+  let cardsObserved = 0;
   const maxRounds = Number(config.discovery.safetyCapRounds ?? 150);
   const cap = Number(config.discovery.maxCandidatesPerQuery ?? 500);
   const tolerance = Number(config.discovery.bottomTolerancePx ?? 100);
@@ -153,6 +188,7 @@ async function discoverQuery(page, config, query, globalCandidates) {
 
   for (let round = 1; round <= maxRounds; round += 1) {
     const cards = await extractSearchResultCards(page);
+    cardsObserved = Math.max(cardsObserved, cards.length);
     let newThisRound = 0;
     let ambiguousCards = 0;
 
@@ -160,7 +196,7 @@ async function discoverQuery(page, config, query, globalCandidates) {
       const selected = selectCardPost(card);
       if (!selected) continue;
       if (selected.alternativePostKeys.length) ambiguousCards += 1;
-      const { identity, link, alternativePostKeys } = selected;
+      const { identity, link, alternativePostKeys, sourceLinkKind } = selected;
       queryKeys.add(identity.key);
       const existing = globalCandidates.get(identity.key);
       if (!existing) {
@@ -179,6 +215,8 @@ async function discoverQuery(page, config, query, globalCandidates) {
             discoverySurface: scope === 'topic' ? 'facebook-global-posts-search' : 'facebook-group-search',
             discoveryScopeGroupId: groupId,
             originalHref: link.href,
+            originalHrefKind: sourceLinkKind,
+            originalHrefHadCommentHighlight: sourceLinkKind !== 'clean-post-link',
             originalGroupIdentifier: identity.groupIdentifier,
             canonicalGroupIdentifier: identity.groupIdentifier,
             canonicalPostId: identity.postId,
@@ -229,13 +267,16 @@ async function discoverQuery(page, config, query, globalCandidates) {
   }
 
   const finalMetrics = await scrollMetrics(page);
+  const extractionFailed = completionReason === 'bottom-stable' && cardsObserved > 0 && queryKeys.size === 0;
+  if (extractionFailed) completionReason = 'candidate-extraction-failed';
   return {
     query,
     scope,
     searchUrl: url,
     candidateCount: queryKeys.size,
+    cardsObserved,
     completionReason,
-    completeness: completionReason === 'bottom-stable' ? 'complete' : 'truncated',
+    completeness: completionReason === 'bottom-stable' ? 'complete' : (extractionFailed ? 'failed' : 'truncated'),
     finalMetrics: { ...finalMetrics, atBottom: finalMetrics.remainingPx <= tolerance },
     rounds: roundLogs,
   };
@@ -282,7 +323,7 @@ export async function runTopicDiscovery({ configPath = 'config.json', query = nu
   };
   await atomicWriteJson(path.join(runDir, 'discovery.json'), discovery);
   await atomicWriteJson(path.join(runDir, 'DISCOVERY_RUN.json'), {
-    status: diagnostics.every((item) => item.completeness === 'complete') ? 'completed' : 'truncated',
+    status: diagnostics.every((item) => item.completeness === 'complete') ? 'completed' : (diagnostics.some((item) => item.completeness === 'failed') ? 'failed' : 'truncated'),
     generatedAt: new Date().toISOString(),
     discoveryScope: config.discovery.scope,
     candidateCount: serialized.length,
