@@ -23,11 +23,7 @@ function parseCli(rawArgs = process.argv.slice(2)) {
     },
   });
   if (!values['from-run']) throw new Error('--from-run <run-dir|dataset.json> is required');
-  return {
-    config: values.config ?? 'config.json',
-    fromRun: values['from-run'],
-    corpusIndex: values['corpus-index'] ?? null,
-  };
+  return { config: values.config ?? 'config.json', fromRun: values['from-run'], corpusIndex: values['corpus-index'] ?? null };
 }
 
 async function loadConfig(configArg) {
@@ -46,9 +42,7 @@ async function loadConfig(configArg) {
   };
 }
 
-function resolveFromConfig(config, value) {
-  return path.resolve(config._baseDir, value);
-}
+function resolveFromConfig(config, value) { return path.resolve(config._baseDir, value); }
 
 async function resolveDatasetPath(fromRun) {
   const requested = path.resolve(process.cwd(), fromRun);
@@ -72,6 +66,18 @@ function candidateFromNormalized(record) {
   };
 }
 
+function correctNormalizedSource(normalizedRecord, candidate) {
+  const corrected = structuredClone(normalizedRecord);
+  corrected.source ??= {};
+  corrected.source.key = candidate.corpusKey;
+  corrected.source.postId = candidate.postId;
+  if (candidate.groupId) corrected.source.groupId = candidate.groupId;
+  if (candidate.canonicalUrl) corrected.source.canonicalUrl = candidate.canonicalUrl;
+  corrected.extraction ??= {};
+  corrected.extraction.corpusImportedAt = new Date().toISOString();
+  return corrected;
+}
+
 async function main() {
   const cli = parseCli();
   const config = await loadConfig(cli.config);
@@ -79,9 +85,7 @@ async function main() {
   const dataset = JSON.parse(await fs.readFile(datasetPath, 'utf8'));
   if (!Array.isArray(dataset)) throw new Error(`Expected dataset array: ${datasetPath}`);
 
-  const indexPath = cli.corpusIndex
-    ? path.resolve(process.cwd(), cli.corpusIndex)
-    : resolveFromConfig(config, config.corpus.indexPath);
+  const indexPath = cli.corpusIndex ? path.resolve(process.cwd(), cli.corpusIndex) : resolveFromConfig(config, config.corpus.indexPath);
   const cacheDir = resolveFromConfig(config, config.corpus.cacheDir);
   const acceptedVersions = new Set(config.corpus.acceptedAcceptanceVersions ?? []);
   const registry = await loadCorpusRegistry(indexPath);
@@ -89,14 +93,15 @@ async function main() {
   let reusable = 0;
   let bodyOnly = 0;
   let skipped = 0;
+  let provenanceCorrected = 0;
   const importedPostIds = [];
 
   for (const normalizedRecord of dataset) {
     const candidate = candidateFromNormalized(normalizedRecord);
-    if (!candidate.postId || !candidate.corpusKey) {
-      skipped += 1;
-      continue;
-    }
+    if (!candidate.postId || !candidate.corpusKey) { skipped += 1; continue; }
+
+    const oldKey = normalizedRecord?.source?.key ?? null;
+    if (oldKey && oldKey !== candidate.corpusKey) provenanceCorrected += 1;
 
     let corpusRecord = upsertDiscovery(registry, candidate, candidate.queries);
     corpusRecord = recordBodyPreflight(registry, candidate, {
@@ -112,13 +117,8 @@ async function main() {
       && (acceptedVersions.size === 0 || acceptedVersions.has(acceptanceVersion));
 
     if (strictComplete) {
-      await cacheCompleteRecord({
-        registry,
-        indexPath,
-        cacheDir,
-        normalizedRecord,
-        candidate,
-      });
+      const corrected = correctNormalizedSource(normalizedRecord, candidate);
+      await cacheCompleteRecord({ registry, indexPath, cacheDir, normalizedRecord: corrected, candidate });
       reusable += 1;
     } else {
       corpusRecord.status = 'seen';
@@ -133,20 +133,18 @@ async function main() {
   console.log('==================================================');
   console.log('CORPUS IMPORT COMPLETE');
   console.log('==================================================');
-  console.log(`Dataset:            ${datasetPath}`);
-  console.log(`Records:            ${dataset.length}`);
-  console.log(`Reusable complete:  ${reusable}`);
-  console.log(`Body-only indexed:  ${bodyOnly}`);
-  console.log(`Skipped:            ${skipped}`);
-  console.log(`Corpus index:       ${indexPath}`);
-  console.log(`Unique imported IDs:${new Set(importedPostIds).size}`);
+  console.log(`Dataset:              ${datasetPath}`);
+  console.log(`Records:              ${dataset.length}`);
+  console.log(`Reusable complete:    ${reusable}`);
+  console.log(`Body-only indexed:    ${bodyOnly}`);
+  console.log(`Provenance corrected: ${provenanceCorrected}`);
+  console.log(`Skipped:              ${skipped}`);
+  console.log(`Corpus index:         ${indexPath}`);
+  console.log(`Unique imported IDs:  ${new Set(importedPostIds).size}`);
   console.log('==================================================');
 }
 
 const isEntry = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (isEntry) {
-  main().catch((error) => {
-    console.error(error?.stack ?? error);
-    process.exitCode = 1;
-  });
+  main().catch((error) => { console.error(error?.stack ?? error); process.exitCode = 1; });
 }
