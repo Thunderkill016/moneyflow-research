@@ -2,16 +2,27 @@
   "groups": [
     {
       "id": "1569314343856132",
-      "name": "Build in Public VN"
+      "name": "Build in Public VN",
+      "aliases": [
+        "1569314343856132",
+        "indiehackervn"
+      ]
     },
     {
       "id": "j2team.community",
-      "name": "J2TEAM Community"
+      "name": "J2TEAM Community",
+      "aliases": [
+        "j2team.community"
+      ]
     }
   ],
   "group": {
     "id": "1569314343856132",
     "name": "Build in Public VN",
+    "aliases": [
+      "1569314343856132",
+      "indiehackervn"
+    ],
     "note": "Backward-compatible single-group fallback. Default discovery uses groups[]."
   },
   "queryPlan": {

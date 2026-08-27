@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSearchUrl, parseDiscoveryCli, resolveDiscoveryTargets, selectCardPost } from '../src/topic-discovery.mjs';
+import { buildSearchUrl, isCandidateAllowedForTarget, parseDiscoveryCli, resolveDiscoveryTargets, selectCardPost } from '../src/topic-discovery.mjs';
 import { parseCollectCli } from '../src/collect.mjs';
 
 test('topic discovery uses Facebook global Posts search and does not inject a group id', () => {
@@ -14,22 +14,39 @@ test('group discovery builds a scoped search URL', () => {
   assert.equal(url, 'https://www.facebook.com/groups/j2team.community/search/?q=qu%E1%BA%A3n%20l%C3%BD%20chi%20ti%C3%AAu');
 });
 
-test('focused group discovery resolves Build in Public VN and J2TEAM targets', () => {
+test('focused group discovery resolves Build in Public VN and J2TEAM targets with aliases', () => {
   const targets = resolveDiscoveryTargets({
     groups: [
-      { id: '1569314343856132', name: 'Build in Public VN' },
-      { id: 'j2team.community', name: 'J2TEAM Community' },
+      { id: '1569314343856132', name: 'Build in Public VN', aliases: ['1569314343856132', 'indiehackervn'] },
+      { id: 'j2team.community', name: 'J2TEAM Community', aliases: ['j2team.community'] },
     ],
   }, 'group');
   assert.deepEqual(targets, [
-    { id: '1569314343856132', name: 'Build in Public VN' },
-    { id: 'j2team.community', name: 'J2TEAM Community' },
+    { id: '1569314343856132', name: 'Build in Public VN', aliases: ['1569314343856132', 'indiehackervn'] },
+    { id: 'j2team.community', name: 'J2TEAM Community', aliases: ['j2team.community'] },
   ]);
 });
 
-test('group discovery falls back to legacy config.group', () => {
-  const targets = resolveDiscoveryTargets({ group: { id: '1569314343856132', name: 'Build in Public VN' } }, 'group');
-  assert.deepEqual(targets, [{ id: '1569314343856132', name: 'Build in Public VN' }]);
+test('candidate target filter accepts configured aliases for Build in Public and rejects foreign slugs', () => {
+  const bipTarget = { id: '1569314343856132', name: 'Build in Public VN', aliases: ['1569314343856132', 'indiehackervn'] };
+  const j2Target = { id: 'j2team.community', name: 'J2TEAM Community', aliases: ['j2team.community'] };
+
+  // 1569314343856132 <-> indiehackervn => same allowed target
+  assert.equal(isCandidateAllowedForTarget({ groupIdentifier: '1569314343856132' }, bipTarget, 'group'), true);
+  assert.equal(isCandidateAllowedForTarget({ groupIdentifier: 'indiehackervn' }, bipTarget, 'group'), true);
+
+  // j2team.community => allowed only for J2TEAM target
+  assert.equal(isCandidateAllowedForTarget({ groupIdentifier: 'j2team.community' }, j2Target, 'group'), true);
+  assert.equal(isCandidateAllowedForTarget({ groupIdentifier: 'j2team.community' }, bipTarget, 'group'), false);
+
+  // foreign group slug => rejected
+  assert.equal(isCandidateAllowedForTarget({ groupIdentifier: 'GoogleSpreadsheet' }, bipTarget, 'group'), false);
+  assert.equal(isCandidateAllowedForTarget({ groupIdentifier: 'GoogleSpreadsheet' }, j2Target, 'group'), false);
+});
+
+test('group discovery falls back to legacy config.group with aliases', () => {
+  const targets = resolveDiscoveryTargets({ group: { id: '1569314343856132', name: 'Build in Public VN', aliases: ['indiehackervn'] } }, 'group');
+  assert.deepEqual(targets, [{ id: '1569314343856132', name: 'Build in Public VN', aliases: ['1569314343856132', 'indiehackervn'] }]);
 });
 
 test('group discovery refuses to run without any configured group', () => {

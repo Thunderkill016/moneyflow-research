@@ -32,14 +32,42 @@ export function parseDiscoveryCli(rawArgs = process.argv.slice(2)) {
   };
 }
 
+export function isCandidateAllowedForTarget(identity, target, scope) {
+  if (scope !== 'group') return true;
+  if (!target) return true;
+  const aliases = Array.isArray(target.aliases) && target.aliases.length > 0
+    ? target.aliases
+    : (target.id ? [String(target.id)] : []);
+  if (aliases.length === 0) return true;
+  return aliases.includes(identity.groupIdentifier);
+}
+
 export function resolveDiscoveryTargets(parsed, scope) {
-  if (scope === 'topic') return [{ id: null, name: 'Facebook global Posts search' }];
+  if (scope === 'topic') return [{ id: null, name: 'Facebook global Posts search', aliases: [] }];
   const configured = Array.isArray(parsed.groups) ? parsed.groups : [];
   const targets = configured
     .filter((group) => group && group.id)
-    .map((group) => ({ id: String(group.id), name: group.name ?? String(group.id) }));
+    .map((group) => {
+      const id = String(group.id);
+      const aliases = Array.isArray(group.aliases)
+        ? [...new Set([id, ...group.aliases.map(String)])]
+        : [id];
+      return {
+        id,
+        name: group.name ?? id,
+        aliases,
+      };
+    });
   if (!targets.length && parsed.group?.id) {
-    targets.push({ id: String(parsed.group.id), name: parsed.group.name ?? String(parsed.group.id) });
+    const id = String(parsed.group.id);
+    const aliases = Array.isArray(parsed.group.aliases)
+      ? [...new Set([id, ...parsed.group.aliases.map(String)])]
+      : [id];
+    targets.push({
+      id,
+      name: parsed.group.name ?? id,
+      aliases,
+    });
   }
   if (!targets.length) throw new Error('discovery.scope="group" requires config.groups[] or config.group.id');
   return targets;
@@ -198,7 +226,7 @@ async function discoverQuery(page, config, query, globalCandidates, target) {
       if (!selected) continue;
       if (selected.alternativePostKeys.length) ambiguousCards += 1;
       const { identity, link, alternativePostKeys, sourceLinkKind } = selected;
-      if (scope === 'group' && identity.groupIdentifier !== groupId) continue;
+      if (scope === 'group' && !isCandidateAllowedForTarget(identity, target, scope)) continue;
       queryKeys.add(identity.key);
       const existing = globalCandidates.get(identity.key);
       if (!existing) {
