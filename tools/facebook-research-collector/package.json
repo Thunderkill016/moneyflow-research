@@ -9,7 +9,7 @@
   },
   "scripts": {
     "login": "node src/index.mjs login",
-    "collect": "node src/collect-v2.mjs",
+    "collect": "node src/index.mjs collect",
     "test": "node --test"
   },
   "dependencies": {
