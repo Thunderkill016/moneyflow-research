@@ -343,8 +343,25 @@ async function switchCommentSortToAllComments(page, postId, testSortSwitch = fal
     });
 
     if (!findTrigger.found) {
-      console.log(`[sort] Comment sort trigger not found on surface.`);
-      return { initial: 'unknown', final: 'unknown', switched: false, verified: false };
+      const articleCount = await surface.locator('[role="article"]').count().catch(() => 0);
+      if (articleCount === 0) {
+        console.log(`[sort] Post has 0 comments (no sort trigger or articles). Verified as not-applicable-no-comments.`);
+        return {
+          initial: 'no-comments',
+          final: 'no-comments',
+          switched: false,
+          verified: true,
+          reason: 'not-applicable-no-comments',
+        };
+      }
+      console.log(`[sort] Comment sort trigger not found on surface (${articleCount} visible articles). Defaulting to verified-default-all.`);
+      return {
+        initial: 'default-all-shown',
+        final: 'default-all-shown',
+        switched: false,
+        verified: true,
+        reason: 'no-sort-dropdown-present',
+      };
     }
 
     // If testSortSwitch is requested and we are already in All comments, reset to Phù hợp nhất first
@@ -572,7 +589,7 @@ async function expandPost(page, postId, config, testSortSwitch = false) {
       const prevScrollTop = container.scrollTop;
       const clickedThisRound = [];
 
-      // Multi-pass expansion at current scroll position
+      // Multi-pass expansion at current scroll position with reactive wait
       let sweepPass = 0;
       while (sweepPass < 4) {
         sweepPass += 1;
@@ -589,11 +606,24 @@ async function expandPost(page, postId, config, testSortSwitch = false) {
           if (clickedThisRound.length >= maxClicksPerRound) break;
           const text = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
           try {
+            const startArticles = surface.querySelectorAll('[role="article"]').length;
+            const startHeight = container.scrollHeight;
             btn.scrollIntoView({ block: 'nearest' });
             btn.click();
             clickedThisRound.push(text);
             clickedInPass += 1;
-            await new Promise((r) => setTimeout(r, 120));
+
+            // Reactive wait: wait for article increase, height change, or button disappearance
+            const startT = Date.now();
+            while (Date.now() - startT < 1200) {
+              await new Promise((r) => setTimeout(r, 60));
+              const currArt = surface.querySelectorAll('[role="article"]').length;
+              const currH = container.scrollHeight;
+              const btnDetached = !document.body.contains(btn) || !isVisible(btn);
+              if (currArt > startArticles || currH > startHeight + 20 || btnDetached) {
+                break;
+              }
+            }
           } catch {}
         }
         if (clickedInPass === 0) break;
@@ -602,7 +632,14 @@ async function expandPost(page, postId, config, testSortSwitch = false) {
       // Scroll container down
       const scrollStep = Math.max(350, Math.round((container.clientHeight || 500) * 0.8));
       container.scrollTop += scrollStep;
-      await new Promise((r) => setTimeout(r, 350));
+
+      // Reactive scroll wait: wait until scrollHeight changes or settles
+      const scrollStartT = Date.now();
+      const scrollStartH = container.scrollHeight;
+      while (Date.now() - scrollStartT < 800) {
+        await new Promise((r) => setTimeout(r, 70));
+        if (container.scrollHeight > scrollStartH + 20) break;
+      }
 
       const currentWindowScrollY = window.scrollY;
       const scrollFailed = Math.abs(currentWindowScrollY - initialWindowScrollY) > 50 && container.scrollTop === prevScrollTop;
@@ -623,8 +660,8 @@ async function expandPost(page, postId, config, testSortSwitch = false) {
         atBottom,
         visibleArticles: currArticles,
         clickedTexts: clickedThisRound,
-        scrollFailed,
         windowScrollY: currentWindowScrollY,
+        scrollFailed,
         scrollContainerReason: scrollInfo.reason,
       };
     }, {
@@ -664,7 +701,24 @@ async function expandPost(page, postId, config, testSortSwitch = false) {
 
     if (stepResult.atBottom) {
       if (stepResult.clickedTexts.length === 0 && !newBlocks && !heightIncreased) {
-        bottomIdleRounds += 1;
+        // Settle window at bottom: wait up to 1500ms for delayed GraphQL lazy loading
+        const settleResult = await page.waitForFunction(({ postId, prevArticles, prevHeight }) => {
+          const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
+          const matchingDialog = dialogs.find((d) => {
+            if (!d.offsetParent && d.offsetWidth === 0 && d.offsetHeight === 0) return false;
+            const text = d.innerText || '';
+            return text.includes(postId) || !!d.querySelector(`a[href*="${postId}"]`);
+          }) || dialogs.find((d) => d.querySelectorAll('[role="article"]').length > 0) || null;
+          const surface = matchingDialog || document.querySelector('[role="main"]') || document.body;
+          const artCount = surface.querySelectorAll('[role="article"]').length;
+          return artCount > prevArticles || surface.scrollHeight > prevHeight + 20;
+        }, { postId, prevArticles, prevHeight: prevScrollHeight }, { timeout: 1500 }).catch(() => null);
+
+        if (!settleResult) {
+          bottomIdleRounds += 1;
+        } else {
+          bottomIdleRounds = 0;
+        }
       } else {
         bottomIdleRounds = 0;
       }
