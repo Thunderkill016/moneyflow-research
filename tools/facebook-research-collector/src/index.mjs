@@ -179,39 +179,159 @@ async function discover(page, config) {
   }));
 }
 
-async function expandPost(page, config) {
-  let idleRounds = 0;
-  for (let round = 0; round < config.collection.expandRounds; round += 1) {
-    const clickable = page.locator('button, a, [role="button"]');
-    const count = await clickable.count();
-    let clicked = 0;
+async function expandPost(page, postId, config) {
+  return page.evaluate(async ({ postId, maxRounds, maxClicksPerRound }) => {
+    // 1. Detect post surface
+    const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
+    const matchingDialog = dialogs.find((d) => {
+      if (!d.offsetParent && d.offsetWidth === 0 && d.offsetHeight === 0) return false;
+      const text = d.innerText || '';
+      return text.includes(postId) || !!d.querySelector(`a[href*="${postId}"]`);
+    }) || dialogs.find((d) => {
+      return d.querySelectorAll('[role="article"]').length > 0 && (d.offsetHeight > 200 || (d.innerText || '').length > 200);
+    }) || null;
 
-    for (let i = 0; i < count && clicked < config.collection.maxClicksPerRound; i += 1) {
-      const item = clickable.nth(i);
-      try {
-        if (!(await item.isVisible())) continue;
-        const text = normalizeWhitespace(await item.innerText({ timeout: 700 }));
-        if (!EXPAND_TEXT.test(text)) continue;
-        await item.click({ timeout: 1_500 });
-        clicked += 1;
-        await randomPause(config, 0.35);
-      } catch {
-        // Facebook re-renders frequently; stale/covered elements are expected and skipped.
+    const surface = matchingDialog || document.querySelector('[role="main"]') || document.querySelector('main') || document.body;
+    const surfaceType = matchingDialog ? 'dialog' : (document.querySelector('[role="main"]') || document.querySelector('main') ? 'main' : 'body');
+
+    // 2. Determine the actual scroll container INSIDE that post surface
+    const findScrollContainer = (root) => {
+      const candidates = [];
+      const elements = [root, ...root.querySelectorAll('*')];
+      for (const el of elements) {
+        const style = window.getComputedStyle(el);
+        const isScrollStyle = (style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 20;
+        const articleCount = el.querySelectorAll('[role="article"]').length;
+        if (isScrollStyle) {
+          candidates.push({
+            el,
+            reason: `overflow-${style.overflowY}-with-scrollDiff-${el.scrollHeight - el.clientHeight}`,
+            articleCount,
+            scrollHeight: el.scrollHeight,
+            clientHeight: el.clientHeight,
+          });
+        }
       }
+      candidates.sort((a, b) => b.articleCount - a.articleCount || b.scrollHeight - a.scrollHeight);
+      return candidates[0] || {
+        el: root,
+        reason: 'surface-fallback',
+        articleCount: root.querySelectorAll('[role="article"]').length,
+        scrollHeight: root.scrollHeight,
+        clientHeight: root.clientHeight,
+      };
+    };
+
+    const scrollInfo = findScrollContainer(surface);
+    const container = scrollInfo.el;
+
+    const roundLogs = [];
+    let prevArticles = surface.querySelectorAll('[role="article"]').length;
+    let prevScrollHeight = container.scrollHeight;
+    let idleRounds = 0;
+    let failedScrollAssertion = false;
+
+    const initialWindowScrollY = window.scrollY;
+
+    for (let round = 0; round < maxRounds; round += 1) {
+      const prevScrollTop = container.scrollTop;
+
+      // 3. Scope ALL expansion controls strictly to the selected post surface
+      const clickables = [...surface.querySelectorAll('button, a, [role="button"]')];
+      const matchingButtons = clickables.filter((el) => {
+        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        return /^(xem thêm|see more|xem thêm bình luận|view more comments|xem thêm .* bình luận|xem thêm phản hồi|view more replies|xem .* câu trả lời|view .* replies|xem các bình luận trước|view previous comments)$/i.test(text);
+      });
+
+      const clickedTexts = [];
+      for (let i = 0; i < matchingButtons.length && clickedTexts.length < maxClicksPerRound; i += 1) {
+        const btn = matchingButtons[i];
+        const text = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
+        try {
+          btn.click();
+          clickedTexts.push(text);
+          await new Promise((r) => setTimeout(r, 450));
+        } catch {
+          // Dynamic re-renders may invalidate nodes
+        }
+      }
+
+      // 4. Scroll only the post's internal scroll container
+      const scrollStep = Math.max(300, Math.round((container.clientHeight || 500) * 0.75));
+      container.scrollTop += scrollStep;
+      await new Promise((r) => setTimeout(r, 1200));
+
+      // 7. Background scroll assertion: if background feed moved while post container didn't scroll
+      const currentWindowScrollY = window.scrollY;
+      if (Math.abs(currentWindowScrollY - initialWindowScrollY) > 50 && container.scrollTop === prevScrollTop) {
+        failedScrollAssertion = true;
+      }
+
+      const currArticles = surface.querySelectorAll('[role="article"]').length;
+      const currScrollHeight = container.scrollHeight;
+      const newBlocks = currArticles > prevArticles;
+      const heightIncreased = currScrollHeight > prevScrollHeight;
+
+      const roundData = {
+        round: round + 1,
+        scrollTop: container.scrollTop,
+        scrollHeight: currScrollHeight,
+        clientHeight: container.clientHeight,
+        visibleArticles: currArticles,
+        matchingControls: matchingButtons.length,
+        clickedCount: clickedTexts.length,
+        clickedTexts: clickedTexts.slice(0, 8),
+        newBlocksAppeared: newBlocks,
+        scrollHeightIncreased: heightIncreased,
+        windowScrollY: currentWindowScrollY,
+      };
+      roundLogs.push(roundData);
+
+      // 6. Completion criterion: stop after 2 consecutive rounds of no clicks, no new blocks, and no scroll expansion
+      if (clickedTexts.length === 0 && !newBlocks && !heightIncreased) {
+        idleRounds += 1;
+      } else {
+        idleRounds = 0;
+      }
+
+      prevArticles = currArticles;
+      prevScrollHeight = currScrollHeight;
+
+      if (idleRounds >= 2) break;
     }
 
-    await page.mouse.wheel(0, Math.max(700, Math.round(config.discovery.scrollPixels * 0.75)));
-    await randomPause(config, 0.8);
-
-    if (clicked === 0) idleRounds += 1;
-    else idleRounds = 0;
-    if (idleRounds >= 2) break;
-  }
+    return {
+      surfaceType,
+      scrollContainerReason: scrollInfo.reason,
+      failedScrollAssertion,
+      totalRounds: roundLogs.length,
+      finalArticles: surface.querySelectorAll('[role="article"]').length,
+      roundLogs,
+    };
+  }, {
+    postId,
+    maxRounds: config.collection.expandRounds ?? 10,
+    maxClicksPerRound: config.collection.maxClicksPerRound ?? 20,
+  });
 }
 
-async function extractPostBundle(page, postId, rawHtmlMaxChars) {
-  return page.evaluate(({ postId, rawHtmlMaxChars }) => {
-    const allArticles = [...document.querySelectorAll('[role="article"]')];
+async function extractPostBundle(page, postId, rawHtmlMaxChars, expansion = null) {
+  return page.evaluate(({ postId, rawHtmlMaxChars, expansion }) => {
+    // 8. Extraction must use the same selected post surface
+    const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
+    const matchingDialog = dialogs.find((d) => {
+      if (!d.offsetParent && d.offsetWidth === 0 && d.offsetHeight === 0) return false;
+      const text = d.innerText || '';
+      return text.includes(postId) || !!d.querySelector(`a[href*="${postId}"]`);
+    }) || dialogs.find((d) => {
+      return d.querySelectorAll('[role="article"]').length > 0 && (d.offsetHeight > 200 || (d.innerText || '').length > 200);
+    }) || null;
+
+    const surface = matchingDialog || document.querySelector('[role="main"]') || document.querySelector('main') || document.body;
+    const surfaceType = matchingDialog ? 'dialog' : (document.querySelector('[role="main"]') || document.querySelector('main') ? 'main' : 'body');
+
+    // Scoped article blocks strictly within the detected post surface
+    const allArticles = [...surface.querySelectorAll('[role="article"]')];
 
     // --- helpers ---
 
@@ -274,7 +394,7 @@ async function extractPostBundle(page, postId, rawHtmlMaxChars) {
       return userLink ?? links.find((x) => x.text && x.text.length <= 120) ?? null;
     };
 
-    // --- score each article as a potential post root ---
+    // --- score each article as a potential post root (for standalone pages) ---
 
     const scored = allArticles.map((node) => {
       const anchors = [...node.querySelectorAll('a[href]')];
@@ -334,29 +454,20 @@ async function extractPostBundle(page, postId, rawHtmlMaxChars) {
       };
     });
 
-    // Determine root container:
-    // When Facebook renders a permalink, it opens the post in a [role="dialog"] modal overlay.
-    // In that modal, comments are [role="article"] elements and the post header/body is in the dialog.
-    const dialog = document.querySelector('[role="dialog"]');
-    const dialogHasContent = dialog && (
-      dialog.querySelectorAll('[role="article"]').length > 0 ||
-      (dialog.innerText || '').includes(postId) ||
-      (dialog.innerText || '').length > 200
-    );
-
     let root = null;
     let rootSelectionType = '';
     let selectedScore = 0;
     let selectedReasons = [];
 
-    if (dialogHasContent) {
-      root = dialog;
+    if (surfaceType === 'dialog') {
+      root = surface;
       rootSelectionType = 'dialog';
       selectedScore = 150;
       selectedReasons = ['permalink-modal-dialog'];
     } else {
+      scored.sort((a, b) => b.score - a.score);
       const bestCandidate = scored[0] && scored[0].score > 0 && !scored[0].isCommentByAria ? scored[0] : null;
-      root = bestCandidate?.node ?? document.querySelector('[role="main"]') ?? document.querySelector('main') ?? document.body;
+      root = bestCandidate?.node ?? surface;
       rootSelectionType = bestCandidate ? 'scored-article' : 'fallback-main';
       selectedScore = bestCandidate?.score ?? 0;
       selectedReasons = bestCandidate?.reasons ?? ['fallback-main'];
@@ -365,8 +476,8 @@ async function extractPostBundle(page, postId, rawHtmlMaxChars) {
     // --- collect comments ---
     // If root is dialog, comments are all role="article" elements inside dialog.
     // If root is article, comments are all role="article" elements on page except root.
-    const commentNodes = root === dialog
-      ? [...dialog.querySelectorAll('[role="article"]')]
+    const commentNodes = root === surface && surfaceType === 'dialog'
+      ? allArticles
       : allArticles.filter((article) => article !== root);
 
     const indexByNode = new Map(commentNodes.map((node, index) => [node, index]));
@@ -431,6 +542,7 @@ async function extractPostBundle(page, postId, rawHtmlMaxChars) {
         selectedReasons,
         articleCandidates,
       },
+      expansion: expansion ?? null,
       post: {
         author: rootAuthor?.text ?? null,
         authorUrl: rootAuthor?.href ?? null,
@@ -444,7 +556,7 @@ async function extractPostBundle(page, postId, rawHtmlMaxChars) {
         htmlTruncated: html.length > rawHtmlMaxChars,
       },
     };
-  }, { postId, rawHtmlMaxChars });
+  }, { postId, rawHtmlMaxChars, expansion });
 }
 
 function normalizeBundle(candidate, bundle, config) {
@@ -498,6 +610,7 @@ function normalizeBundle(candidate, bundle, config) {
     extraction: {
       rootFoundByPostLink: bundle.rootFoundByPostLink,
       rootSelection: bundle.rootSelection ?? null,
+      expansion: bundle.expansion ?? null,
       pageUrl: bundle.pageUrl,
       completeness: 'best-effort; Facebook ranking, privacy, lazy loading, deleted content and UI changes can hide comments',
     },
@@ -589,8 +702,8 @@ async function collect(config, cliLimit) {
       console.log(`[collect ${i + 1}/${selected.length}] ${candidate.canonicalUrl} score=${candidate.relevance.score}`);
       await page.goto(candidate.canonicalUrl, { waitUntil: 'domcontentloaded' });
       await randomPause(config, 1.4);
-      await expandPost(page, config);
-      const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars);
+      const expansion = await expandPost(page, candidate.postId, config);
+      const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars, expansion);
       const normalized = normalizeBundle(candidate, bundle, config);
 
       await fs.writeFile(path.join(rawDir, `${candidate.postId}.json`), JSON.stringify({
@@ -598,6 +711,7 @@ async function collect(config, cliLimit) {
         capturedAt: normalized.capturedAt,
         pageUrl: bundle.pageUrl,
         rootSelection: bundle.rootSelection ?? null,
+        expansion: bundle.expansion ?? null,
         raw: bundle.raw,
       }, null, 2));
       await fs.writeFile(path.join(normalizedDir, `${candidate.postId}.json`), JSON.stringify(normalized, null, 2));
