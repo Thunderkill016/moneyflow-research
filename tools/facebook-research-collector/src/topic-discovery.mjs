@@ -32,20 +32,34 @@ export function parseDiscoveryCli(rawArgs = process.argv.slice(2)) {
   };
 }
 
+export function resolveDiscoveryTargets(parsed, scope) {
+  if (scope === 'topic') return [{ id: null, name: 'Facebook global Posts search' }];
+  const configured = Array.isArray(parsed.groups) ? parsed.groups : [];
+  const targets = configured
+    .filter((group) => group && group.id)
+    .map((group) => ({ id: String(group.id), name: group.name ?? String(group.id) }));
+  if (!targets.length && parsed.group?.id) {
+    targets.push({ id: String(parsed.group.id), name: parsed.group.name ?? String(parsed.group.id) });
+  }
+  if (!targets.length) throw new Error('discovery.scope="group" requires config.groups[] or config.group.id');
+  return targets;
+}
+
 async function loadConfig(configArg, cliQuery = null) {
   const configPath = path.resolve(process.cwd(), configArg);
   const parsed = JSON.parse(await fs.readFile(configPath, 'utf8'));
   const baseDir = path.dirname(configPath);
   const queries = cliQuery ? [cliQuery] : parsed.queries;
   if (!Array.isArray(queries) || queries.length === 0) throw new Error('config.queries must contain at least one query');
-  const scope = parsed.discovery?.scope ?? 'topic';
+  const scope = parsed.discovery?.scope ?? 'group';
   if (!['topic', 'group'].includes(scope)) throw new Error(`Unsupported discovery.scope: ${scope}`);
-  if (scope === 'group' && !parsed.group?.id) throw new Error('config.group.id is required only when discovery.scope="group"');
+  const discoveryTargets = resolveDiscoveryTargets(parsed, scope);
   return {
     ...parsed,
     _configPath: configPath,
     _baseDir: baseDir,
     queries,
+    discoveryTargets,
     browser: { headless: false, profileDir: './profile', locale: 'vi-VN', ...parsed.browser },
     collection: { outputDir: './output', ...parsed.collection },
     discovery: {
@@ -65,7 +79,7 @@ function resolveFromConfig(config, value) {
   return path.resolve(config._baseDir, value);
 }
 
-export function buildSearchUrl({ scope = 'topic', groupId = null, query }) {
+export function buildSearchUrl({ scope = 'group', groupId = null, query }) {
   if (scope === 'group') {
     if (!groupId) throw new Error('groupId is required for group-scoped discovery');
     return `https://www.facebook.com/groups/${encodeURIComponent(groupId)}/search/?q=${encodeURIComponent(query)}`;
@@ -114,19 +128,6 @@ async function extractSearchResultCards(page) {
   });
 }
 
-/**
- * Select the Facebook post represented by one global/group search result card.
- *
- * Global Posts search can render the post timestamp as a URL whose PATH is the
- * real /groups/<group>/posts/<postId> identity while the query string contains
- * ?comment_id=... to highlight a matching comment. That query parameter is
- * discovery provenance, not source identity. Accept it here, canonicalize from
- * the path via parseFacebookPostIdentity(), and prefer a clean post link when
- * the same card happens to expose both forms.
- *
- * Important: this rule is discovery-only. Post-root extraction still rejects
- * comment/reply permalinks as root-selection evidence.
- */
 export function selectCardPost(card) {
   const byIdentity = new Map();
   for (const link of card.links ?? []) {
@@ -168,9 +169,9 @@ async function scrollMetrics(page) {
   });
 }
 
-async function discoverQuery(page, config, query, globalCandidates) {
+async function discoverQuery(page, config, query, globalCandidates, target) {
   const scope = config.discovery.scope;
-  const groupId = scope === 'group' ? config.group?.id ?? null : null;
+  const groupId = scope === 'group' ? target?.id ?? null : null;
   const url = buildSearchUrl({ scope, groupId, query });
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
   await page.waitForTimeout(Math.max(250, Number(config.discovery.settleMs ?? 700)));
@@ -197,6 +198,7 @@ async function discoverQuery(page, config, query, globalCandidates) {
       if (!selected) continue;
       if (selected.alternativePostKeys.length) ambiguousCards += 1;
       const { identity, link, alternativePostKeys, sourceLinkKind } = selected;
+      if (scope === 'group' && identity.groupIdentifier !== groupId) continue;
       queryKeys.add(identity.key);
       const existing = globalCandidates.get(identity.key);
       if (!existing) {
@@ -214,6 +216,7 @@ async function discoverQuery(page, config, query, globalCandidates) {
           provenance: {
             discoverySurface: scope === 'topic' ? 'facebook-global-posts-search' : 'facebook-group-search',
             discoveryScopeGroupId: groupId,
+            discoveryScopeGroupName: target?.name ?? groupId,
             originalHref: link.href,
             originalHrefKind: sourceLinkKind,
             originalHrefHadCommentHighlight: sourceLinkKind !== 'clean-post-link',
@@ -243,6 +246,8 @@ async function discoverQuery(page, config, query, globalCandidates) {
 
     roundLogs.push({
       round,
+      groupId,
+      groupName: target?.name ?? null,
       cards: cards.length,
       queryCandidateCount: queryKeys.size,
       newThisRound,
@@ -272,6 +277,8 @@ async function discoverQuery(page, config, query, globalCandidates) {
   return {
     query,
     scope,
+    groupId,
+    groupName: target?.name ?? null,
     searchUrl: url,
     candidateCount: queryKeys.size,
     cardsObserved,
@@ -300,7 +307,11 @@ export async function runTopicDiscovery({ configPath = 'config.json', query = nu
   const candidates = new Map();
   const diagnostics = [];
   try {
-    for (const q of config.queries) diagnostics.push(await discoverQuery(page, config, q, candidates));
+    for (const q of config.queries) {
+      for (const target of config.discoveryTargets) {
+        diagnostics.push(await discoverQuery(page, config, q, candidates, target));
+      }
+    }
   } finally {
     await context.close();
   }
@@ -315,6 +326,7 @@ export async function runTopicDiscovery({ configPath = 'config.json', query = nu
     generatedAt: new Date().toISOString(),
     discoveryScope: config.discovery.scope,
     discoverySurface: config.discovery.scope === 'topic' ? 'facebook-global-posts-search' : 'facebook-group-search',
+    discoveryTargets: config.discoveryTargets,
     queries: config.queries,
     candidateCount: serialized.length,
     relevantCount: null,
@@ -326,6 +338,7 @@ export async function runTopicDiscovery({ configPath = 'config.json', query = nu
     status: diagnostics.every((item) => item.completeness === 'complete') ? 'completed' : (diagnostics.some((item) => item.completeness === 'failed') ? 'failed' : 'truncated'),
     generatedAt: new Date().toISOString(),
     discoveryScope: config.discovery.scope,
+    discoveryTargets: config.discoveryTargets,
     candidateCount: serialized.length,
     diagnostics: diagnostics.map(({ rounds, ...item }) => ({ ...item, roundCount: rounds.length })),
   });
@@ -336,7 +349,7 @@ async function main() {
   const cli = parseDiscoveryCli();
   if (!['discover', 'collect'].includes(cli.command)) throw new Error('Usage: topic-discovery.mjs discover [--config config.json] [--query topic] [--output-dir dir]');
   const result = await runTopicDiscovery({ configPath: cli.config, query: cli.query, outputDir: cli.outputDir });
-  console.log(`[topic-discovery] scope=${result.discovery.discoveryScope} candidates=${result.discovery.candidateCount}`);
+  console.log(`[topic-discovery] scope=${result.discovery.discoveryScope} targets=${result.discovery.discoveryTargets.length} candidates=${result.discovery.candidateCount}`);
   console.log(`[topic-discovery] output=${result.runDir}`);
 }
 
