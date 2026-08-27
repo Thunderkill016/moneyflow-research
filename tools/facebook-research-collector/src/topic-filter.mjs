@@ -43,29 +43,69 @@ export function classifyFullBody({ body = '', query = '', relevance = {}, topicF
   const negatives = matchWeightedRules(normalizedBody, topicFilter.negativeAnchors ?? [], -1);
   const exactQuery = Boolean(normalizedQuery && containsTerm(normalizedBody, normalizedQuery));
   const queryBoost = exactQuery ? Number(topicFilter.queryBoost ?? 5) : 0;
-  const score = include.score + exclude.score + anchors.score + negatives.score + queryBoost;
+
+  const positiveScore = include.score + anchors.score + queryBoost;
+  const negativeScore = exclude.score + negatives.score;
+  const negativeMagnitude = Math.abs(negativeScore);
+  const score = positiveScore + negativeScore;
+
   const strongHits = anchors.matched.filter((item) => item.strong || item.weight >= 3).length;
+  const strongNegativeHits = negatives.matched.filter((item) => item.strong || Math.abs(item.weight) >= 5).length;
   const inTopicThreshold = Number(topicFilter.inTopicThreshold ?? relevance.threshold ?? 5);
   const adjacentThreshold = Number(topicFilter.adjacentThreshold ?? Math.max(1, inTopicThreshold - 3));
   const minBodyChars = Number(topicFilter.minBodyChars ?? 80);
+  const hardRejectMinNegativeScore = Number(topicFilter.hardRejectMinNegativeScore ?? 8);
+
+  const clearNegativeEvidence = !exactQuery
+    && strongHits === 0
+    && strongNegativeHits >= 1
+    && negativeMagnitude >= hardRejectMinNegativeScore
+    && positiveScore < adjacentThreshold;
 
   let classification;
+  let decision;
+  let reason;
+
   if (exactQuery || (score >= inTopicThreshold && strongHits >= 1)) {
     classification = 'in-topic';
+    decision = 'COLLECT';
+    reason = exactQuery ? 'exact-query-match' : 'strong-positive-evidence';
   } else if (score >= adjacentThreshold || strongHits >= 1) {
     classification = 'adjacent';
-  } else if (normalizedBody.length < minBodyChars) {
-    classification = 'ambiguous';
-  } else {
+    decision = 'REVIEW-COLLECT';
+    reason = 'partial-positive-evidence';
+  } else if (clearNegativeEvidence) {
     classification = 'out-of-topic';
+    decision = 'HARD-REJECT';
+    reason = 'clear-negative-evidence-without-strong-pfm-signal';
+  } else {
+    classification = 'ambiguous';
+    decision = 'REVIEW-COLLECT';
+    reason = normalizedBody.length < minBodyChars
+      ? 'insufficient-body-evidence'
+      : 'insufficient-evidence-to-hard-reject';
   }
 
   return {
     classification,
+    decision,
+    reason,
     score,
+    positiveScore,
+    negativeScore,
+    negativeMagnitude,
     exactQuery,
     strongHits,
-    thresholds: { inTopic: inTopicThreshold, adjacent: adjacentThreshold, minBodyChars },
+    strongNegativeHits,
+    clearNegativeEvidence,
+    thresholds: {
+      inTopic: inTopicThreshold,
+      adjacent: adjacentThreshold,
+      minBodyChars,
+      hardRejectMinNegativeScore,
+    },
+    matchedPositive: [...include.matched, ...anchors.matched],
+    matchedNegative: [...exclude.matched, ...negatives.matched],
     matched: [...include.matched, ...exclude.matched, ...anchors.matched, ...negatives.matched],
   };
 }
