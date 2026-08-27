@@ -1,13 +1,23 @@
 {
+  "groups": [
+    {
+      "id": "1569314343856132",
+      "name": "Build in Public VN"
+    },
+    {
+      "id": "j2team.community",
+      "name": "J2TEAM Community"
+    }
+  ],
   "group": {
     "id": "1569314343856132",
     "name": "Build in Public VN",
-    "note": "Optional debug scope only when discovery.scope=group. Topic-first discovery does not constrain results to this group."
+    "note": "Backward-compatible single-group fallback. Default discovery uses groups[]."
   },
   "queryPlan": {
     "version": "pfm-corpus-v1",
     "sourceRun": "2026-08-27T19-01-01-462Z",
-    "strategy": "recall-first-topic-wide-full-body-assessor-gate",
+    "strategy": "two-group-focused-full-body-assessor-gate",
     "primaryQueries": [
       "quản lý chi tiêu",
       "quản lý thu chi",
@@ -118,7 +128,7 @@
     "maxMs": 3200
   },
   "discovery": {
-    "scope": "topic",
+    "scope": "group",
     "safetyCapRounds": 150,
     "scrollPixels": 1400,
     "stableBottomRounds": 3,
@@ -129,7 +139,9 @@
   "corpus": {
     "indexPath": "./corpus/index.json",
     "cacheDir": "./corpus/posts",
-    "acceptedAcceptanceVersions": ["v0.3.0-strict"],
+    "acceptedAcceptanceVersions": [
+      "v0.3.0-strict"
+    ],
     "nearDuplicateMaxHamming": 4
   },
   "review": {
