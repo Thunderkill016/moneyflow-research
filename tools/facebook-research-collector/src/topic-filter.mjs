@@ -10,12 +10,22 @@ export function normalizeForTopicMatch(value = '') {
     .toLowerCase();
 }
 
+function searchableText(value = '') {
+  return ` ${normalizeForTopicMatch(value).replace(/[^\p{L}\p{N}]+/gu, ' ').replace(/\s+/g, ' ').trim()} `;
+}
+
+function containsTerm(normalizedBody, term) {
+  const haystack = searchableText(normalizedBody);
+  const needle = searchableText(term);
+  return needle.trim().length > 0 && haystack.includes(needle);
+}
+
 function matchWeightedRules(normalizedBody, rules = [], sign = 1) {
   let score = 0;
   const matched = [];
   for (const rule of rules) {
     const term = normalizeForTopicMatch(rule?.term ?? '');
-    if (!term || !normalizedBody.includes(term)) continue;
+    if (!term || !containsTerm(normalizedBody, term)) continue;
     const rawWeight = Number(rule?.weight ?? 1);
     const weight = Number.isFinite(rawWeight) ? Math.abs(rawWeight) : 1;
     score += sign * weight;
@@ -31,7 +41,7 @@ export function classifyFullBody({ body = '', query = '', relevance = {}, topicF
   const exclude = matchWeightedRules(normalizedBody, relevance.exclude ?? [], -1);
   const anchors = matchWeightedRules(normalizedBody, topicFilter.anchors ?? [], 1);
   const negatives = matchWeightedRules(normalizedBody, topicFilter.negativeAnchors ?? [], -1);
-  const exactQuery = Boolean(normalizedQuery && normalizedBody.includes(normalizedQuery));
+  const exactQuery = Boolean(normalizedQuery && containsTerm(normalizedBody, normalizedQuery));
   const queryBoost = exactQuery ? Number(topicFilter.queryBoost ?? 5) : 0;
   const score = include.score + exclude.score + anchors.score + negatives.score + queryBoost;
   const strongHits = anchors.matched.filter((item) => item.strong || item.weight >= 3).length;
