@@ -1,12 +1,13 @@
 {
   "group": {
     "id": "1569314343856132",
-    "name": "Build in Public VN"
+    "name": "Build in Public VN",
+    "note": "Optional debug scope only when discovery.scope=group. Topic-first discovery does not constrain results to this group."
   },
   "queryPlan": {
     "version": "pfm-corpus-v1",
     "sourceRun": "2026-08-27T19-01-01-462Z",
-    "strategy": "recall-first-full-body-assessor-gate",
+    "strategy": "recall-first-topic-wide-full-body-assessor-gate",
     "primaryQueries": [
       "quản lý chi tiêu",
       "quản lý thu chi",
@@ -117,8 +118,12 @@
     "maxMs": 3200
   },
   "discovery": {
+    "scope": "topic",
     "safetyCapRounds": 150,
     "scrollPixels": 1400,
+    "stableBottomRounds": 3,
+    "bottomTolerancePx": 100,
+    "settleMs": 700,
     "maxCandidatesPerQuery": 500
   },
   "corpus": {
