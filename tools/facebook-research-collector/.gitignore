@@ -1,5 +1,6 @@
 node_modules/
 profile/
 output/
+corpus/
 config.json
 *.log
