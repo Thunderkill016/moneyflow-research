@@ -100,8 +100,8 @@ export async function classifyPostSemantically({ body, query = '', config = {}, 
               additionalProperties: false,
               properties: {
                 relevant: { type: 'boolean' },
-                confidence: { type: 'number', minimum: 0, maximum: 1 },
-                reason: { type: 'string', maxLength: 240 },
+                confidence: { type: 'number' },
+                reason: { type: 'string' },
               },
               required: ['relevant', 'confidence', 'reason'],
             },
@@ -123,8 +123,8 @@ export async function classifyPostSemantically({ body, query = '', config = {}, 
     }
     return {
       relevant: parsed.relevant,
-      confidence: parsed.confidence,
-      reason: parsed.reason,
+      confidence: Math.max(0, Math.min(1, parsed.confidence)),
+      reason: parsed.reason.trim(),
       model: settings.model,
       provider: settings.provider,
     };
