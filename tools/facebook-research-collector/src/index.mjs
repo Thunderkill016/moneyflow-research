@@ -87,8 +87,8 @@ async function loadConfig(configArg, cliQuery = null) {
       ...parsed.pacing,
     },
     discovery: {
-      safetyCapRounds: 90,
-      scrollPixels: 1500,
+      safetyCapRounds: 150,
+      scrollPixels: 1400,
       maxCandidatesPerQuery: 500,
       ...parsed.discovery,
     },
@@ -267,18 +267,18 @@ async function discover(page, config) {
 
       prevScrollHeight = metrics.scrollHeight;
 
-      // Dynamic fast scroll towards bottom
-      const scrollStep = Math.max(3000, Math.round((metrics.clientHeight || 900) * 2.5));
-      await page.evaluate((step) => window.scrollBy(0, step), scrollStep);
+      // Incremental continuous scroll by scrollPixels (1400px)
+      await page.evaluate((step) => window.scrollBy(0, step), scrollPixels);
 
-      // Reactive wait for DOM update (scrollHeight change or new link elements)
+      // Reactive wait: if at bottom, allow settle window (2500ms) for Facebook GraphQL lazy load
+      const settleTimeout = atBottom ? 2500 : 800;
       await page.waitForFunction(
         (prev) => {
           const el = document.scrollingElement || document.body;
           return el.scrollHeight > prev + 40;
         },
         metrics.scrollHeight,
-        { timeout: 650 }
+        { timeout: settleTimeout }
       ).catch(() => {});
     }
 
@@ -690,12 +690,20 @@ async function expandPost(page, postId, config, testSortSwitch = false) {
   const completeness = completionReason === 'bottom-stable' ? 'complete' : 'truncated';
   console.log(`\n[post] COMPLETE comments=${prevArticles} reason=${completionReason} completeness=${completeness}`);
 
-  // Scan suspicious unmatched controls
-  const suspiciousUnmatched = await page.evaluate(({ expandRegexesSrc }) => {
+  // Scan suspicious unmatched controls on the exact target surface
+  const suspiciousUnmatched = await page.evaluate(({ postId, expandRegexesSrc }) => {
     const EXPAND_REGEXES = expandRegexesSrc.map((src) => new RegExp(src, 'i'));
     const isExpandText = (text) => EXPAND_REGEXES.some((re) => re.test(text));
     const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
-    const surface = dialogs[0] || document.querySelector('[role="main"]') || document.body;
+    const matchingDialog = dialogs.find((d) => {
+      if (!d.offsetParent && d.offsetWidth === 0 && d.offsetHeight === 0) return false;
+      const text = d.innerText || '';
+      return text.includes(postId) || !!d.querySelector(`a[href*="${postId}"]`);
+    }) || dialogs.find((d) => {
+      return d.querySelectorAll('[role="article"]').length > 0 && (d.offsetHeight > 200 || (d.innerText || '').length > 200);
+    }) || null;
+
+    const surface = matchingDialog || document.querySelector('[role="main"]') || document.querySelector('main') || document.body;
     const isVisible = (el) => {
       const style = window.getComputedStyle(el);
       return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && (el.offsetWidth > 0 || el.offsetHeight > 0);
@@ -714,7 +722,7 @@ async function expandPost(page, postId, config, testSortSwitch = false) {
       }
     }
     return suspicious;
-  }, { expandRegexesSrc: EXPAND_REGEXES.map((re) => re.source) });
+  }, { postId, expandRegexesSrc: EXPAND_REGEXES.map((re) => re.source) });
 
   return {
     surfaceType: initInfo.surfaceType,
@@ -978,6 +986,8 @@ async function extractPostBundle(page, postId, rawHtmlMaxChars, expansion = null
   }, { postId, rawHtmlMaxChars, expansion });
 }
 
+export const ACCEPTANCE_VERSION = 'v0.3.0-strict';
+
 function normalizeBundle(candidate, bundle, config) {
   const postText = cleanFacebookPostText(bundle.post.rawText, bundle.post.author ?? '') ||
     cleanFacebookPostText(candidate.preview ?? '', bundle.post.author ?? '');
@@ -1027,6 +1037,7 @@ function normalizeBundle(candidate, bundle, config) {
     },
     comments: uniqueBy(comments, (item) => item.fingerprint),
     extraction: {
+      acceptanceVersion: ACCEPTANCE_VERSION,
       rootFoundByPostLink: bundle.rootFoundByPostLink,
       rootSelection: bundle.rootSelection ?? null,
       expansion: bundle.expansion ?? null,
@@ -1202,15 +1213,15 @@ async function collect(config, options = {}) {
         relevance: scoreRelevance(c.preview, config.relevance),
       }));
       discoveryDiagnostics = discoveryData.discoveryDiagnostics || [];
-      ranked = candidates
-        .filter((item) => item.relevance.relevant)
-        .sort((a, b) => b.relevance.score - a.relevance.score || b.preview.length - a.preview.length);
-      console.log(`[from-discovery] Loaded ${candidates.length} candidates, ${ranked.length} relevant.`);
+      // Rank by relevance score, but KEEP all candidates
+      ranked = [...candidates].sort((a, b) => b.relevance.score - a.relevance.score || b.preview.length - a.preview.length);
+      const relevantCount = candidates.filter((c) => c.relevance?.relevant).length;
+      console.log(`[from-discovery] Loaded ${candidates.length} candidates (${relevantCount} keyword-matched score >= ${config.relevance.threshold}).`);
       await fs.writeFile(path.join(runDir, 'discovery.json'), JSON.stringify({
         group: config.group,
         queries: config.queries,
         candidateCount: candidates.length,
-        relevantCount: ranked.length,
+        relevantCount,
         discoveryDiagnostics,
         candidates,
       }, null, 2));
@@ -1221,15 +1232,15 @@ async function collect(config, options = {}) {
       const discResult = await discover(page, config);
       candidates = discResult.candidates;
       discoveryDiagnostics = discResult.discoveryDiagnostics;
-      ranked = candidates
-        .filter((item) => item.relevance.relevant)
-        .sort((a, b) => b.relevance.score - a.relevance.score || b.preview.length - a.preview.length);
+      // Rank by relevance score, but KEEP all candidates
+      ranked = [...candidates].sort((a, b) => b.relevance.score - a.relevance.score || b.preview.length - a.preview.length);
+      const relevantCount = candidates.filter((c) => c.relevance?.relevant).length;
 
       await fs.writeFile(path.join(runDir, 'discovery.json'), JSON.stringify({
         group: config.group,
         queries: config.queries,
         candidateCount: candidates.length,
-        relevantCount: ranked.length,
+        relevantCount,
         discoveryDiagnostics,
         candidates: candidates.map((item) => ({ ...item, relevance: item.relevance })),
       }, null, 2));
@@ -1237,26 +1248,27 @@ async function collect(config, options = {}) {
 
     // Mode 2: Discovery Only
     if (options.discoveryOnly) {
+      const relevantCount = candidates.filter((c) => c.relevance?.relevant).length;
       await writeRunStatus({
         status: 'completed',
         completedAt: new Date().toISOString(),
         stage: 'discovery-complete',
         records: 0,
         candidateCount: candidates.length,
-        relevantCount: ranked.length,
+        relevantCount,
         mode: 'discovery-only',
       });
-      console.log(`\n[discovery-only] Complete. Candidates: ${candidates.length}, Relevant: ${ranked.length}. Local output: ${runDir}`);
+      console.log(`\n[discovery-only] Complete. Discovered: ${candidates.length} candidates (keyword-matched: ${relevantCount}). Local output: ${runDir}`);
       return;
     }
 
-    // Mode 1: Search + Collect Relevant Posts
+    // Mode 1: Collect ALL Discovered Posts (ranking prioritized by relevance, bounded only if explicit --limit is set)
     const maxPosts = Number.isFinite(options.limit) && options.limit > 0
       ? options.limit
-      : (options.query ? ranked.length : config.collection.maxPosts);
+      : ranked.length;
     const selected = ranked.slice(0, maxPosts);
 
-    console.log(`\n[select] ${candidates.length} candidates, ${ranked.length} relevant, collecting ${selected.length}`);
+    console.log(`\n[select] ${candidates.length} discovered candidates, attempting collection for ${selected.length} posts`);
 
     currentStage = 'collection';
     await writeRunStatus({ status: 'running', stage: currentStage, selectedCount: selected.length });
@@ -1268,14 +1280,25 @@ async function collect(config, options = {}) {
       const normPath = path.join(normalizedDir, `${candidate.postId}.json`);
       const rawPath = path.join(rawDir, `${candidate.postId}.json`);
 
-      // Resume check: if already collected and complete
+      // Strict Resume check: verifies version and all strict completeness invariants
       if (options.resume && (await fileExists(normPath)) && (await fileExists(rawPath))) {
         try {
           const existingNorm = JSON.parse(await fs.readFile(normPath, 'utf8'));
           const existingRaw = JSON.parse(await fs.readFile(rawPath, 'utf8'));
-          const completeness = existingRaw?.expansion?.completeness ?? 'complete';
-          if (existingNorm?.schemaVersion && existingNorm?.comments && completeness === 'complete') {
-            console.log(`[resume ${i + 1}/${selected.length}] Skipping already completed post ${candidate.postId} (${candidate.canonicalUrl}).`);
+          const exp = existingRaw?.expansion;
+          const extraction = existingNorm?.extraction;
+
+          const isStrictComplete =
+            existingNorm?.schemaVersion &&
+            Array.isArray(existingNorm?.comments) &&
+            extraction?.acceptanceVersion === ACCEPTANCE_VERSION &&
+            exp?.completeness === 'complete' &&
+            exp?.commentSort?.verified === true &&
+            exp?.failedScrollAssertion === false &&
+            (exp?.suspiciousUnmatched?.length ?? 0) === 0;
+
+          if (isStrictComplete) {
+            console.log(`[resume ${i + 1}/${selected.length}] Skipping verified complete post ${candidate.postId} (${candidate.canonicalUrl}).`);
             collected.push(existingNorm);
             postOutcomes.push({
               postId: candidate.postId,
@@ -1283,11 +1306,13 @@ async function collect(config, options = {}) {
               author: existingNorm.post?.author ?? 'Unknown',
               commentsCount: existingNorm.comments.length,
               status: 'complete',
-              completionReason: existingRaw?.expansion?.completionReason ?? 'resumed',
+              completionReason: exp?.completionReason ?? 'resumed',
               truncationReason: null,
               resumed: true,
             });
             continue;
+          } else {
+            console.log(`[resume ${i + 1}/${selected.length}] Existing post ${candidate.postId} lacks strict acceptance verification (version=${extraction?.acceptanceVersion}). Re-collecting...`);
           }
         } catch {}
       }
@@ -1319,14 +1344,38 @@ async function collect(config, options = {}) {
           await fs.writeFile(path.join(normalizedDir, `${candidate.postId}.md`), toMarkdown(normalized));
           collected.push(normalized);
 
+          const isStrictComplete =
+            expansion.completeness === 'complete' &&
+            expansion.commentSort?.verified === true &&
+            expansion.failedScrollAssertion === false &&
+            (expansion.suspiciousUnmatched?.length ?? 0) === 0;
+
+          let postStatus = 'complete';
+          let postTruncationReason = null;
+
+          if (!isStrictComplete) {
+            postStatus = 'truncated';
+            if (expansion.completeness === 'truncated') {
+              postTruncationReason = expansion.truncationReason || 'safety-cap';
+            } else if (expansion.commentSort?.verified !== true) {
+              postTruncationReason = 'unverified-sort';
+            } else if (expansion.failedScrollAssertion) {
+              postTruncationReason = 'failed-scroll-assertion';
+            } else if ((expansion.suspiciousUnmatched?.length ?? 0) > 0) {
+              postTruncationReason = `suspicious-unmatched: ${expansion.suspiciousUnmatched.join(', ')}`;
+            } else {
+              postTruncationReason = 'incomplete-convergence';
+            }
+          }
+
           outcomeData = {
             postId: candidate.postId,
             url: candidate.canonicalUrl,
             author: normalized.post.author ?? 'Unknown',
             commentsCount: normalized.comments.length,
-            status: expansion.completeness === 'complete' ? 'complete' : 'truncated',
+            status: postStatus,
             completionReason: expansion.completionReason,
-            truncationReason: expansion.truncationReason,
+            truncationReason: postTruncationReason,
           };
           postSuccess = true;
         } catch (err) {
@@ -1362,7 +1411,7 @@ async function collect(config, options = {}) {
     const reconciliation = {
       topic: options.query ?? (config.queries.length === 1 ? config.queries[0] : 'all'),
       discovered: candidates.length,
-      relevant: ranked.length,
+      relevant: candidates.filter((c) => c.relevance?.relevant).length,
       attempted: selected.length,
       complete: completeCount,
       truncated: truncatedCount,

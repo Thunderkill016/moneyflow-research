@@ -32,9 +32,9 @@
     "maxMs": 3200
   },
   "discovery": {
-    "scrollRounds": 6,
+    "safetyCapRounds": 150,
     "scrollPixels": 1400,
-    "maxCandidatesPerQuery": 40
+    "maxCandidatesPerQuery": 500
   },
   "relevance": {
     "threshold": 5,
