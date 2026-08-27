@@ -1,0 +1,63 @@
+{
+  "group": {
+    "id": "1569314343856132",
+    "name": "Build in Public VN"
+  },
+  "queries": [
+    "quản lý chi tiêu",
+    "tài chính cá nhân",
+    "ghi chép chi tiêu",
+    "expense tracker",
+    "thu chi",
+    "sao kê",
+    "ngân hàng",
+    "ví điện tử",
+    "zalo bot",
+    "telegram bot"
+  ],
+  "browser": {
+    "headless": false,
+    "profileDir": "./profile",
+    "locale": "vi-VN"
+  },
+  "pacing": {
+    "minMs": 1400,
+    "maxMs": 3200
+  },
+  "discovery": {
+    "scrollRounds": 6,
+    "scrollPixels": 1400,
+    "maxCandidatesPerQuery": 40
+  },
+  "relevance": {
+    "threshold": 5,
+    "include": [
+      { "term": "tài chính cá nhân", "weight": 4 },
+      { "term": "quản lý chi tiêu", "weight": 4 },
+      { "term": "thu chi", "weight": 3 },
+      { "term": "chi tiêu", "weight": 3 },
+      { "term": "giao dịch", "weight": 2 },
+      { "term": "ngân hàng", "weight": 2 },
+      { "term": "sao kê", "weight": 2 },
+      { "term": "tiền mặt", "weight": 2 },
+      { "term": "ví điện tử", "weight": 2 },
+      { "term": "ghi chép", "weight": 2 },
+      { "term": "đồng bộ", "weight": 1 },
+      { "term": "phân loại", "weight": 1 },
+      { "term": "tài khoản", "weight": 1 },
+      { "term": "expense", "weight": 2 },
+      { "term": "personal finance", "weight": 4 }
+    ],
+    "exclude": [
+      { "term": "tuyển dụng", "weight": 4 },
+      { "term": "crm bán hàng", "weight": 3 }
+    ]
+  },
+  "collection": {
+    "maxPosts": 25,
+    "expandRounds": 10,
+    "maxClicksPerRound": 20,
+    "outputDir": "./output",
+    "rawHtmlMaxChars": 1500000
+  }
+}
