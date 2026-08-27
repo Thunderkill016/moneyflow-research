@@ -1151,8 +1151,10 @@ async function collect(config, options = {}) {
       return;
     }
 
-    // Mode 1: Search + Collect Top Posts
-    const maxPosts = Number.isFinite(options.limit) && options.limit > 0 ? options.limit : config.collection.maxPosts;
+    // Mode 1: Search + Collect Relevant Posts
+    const maxPosts = Number.isFinite(options.limit) && options.limit > 0
+      ? options.limit
+      : (options.query ? ranked.length : config.collection.maxPosts);
     const selected = ranked.slice(0, maxPosts);
 
     console.log(`\n[select] ${candidates.length} candidates, ${ranked.length} relevant, collecting ${selected.length}`);
@@ -1160,39 +1162,123 @@ async function collect(config, options = {}) {
     currentStage = 'collection';
     await writeRunStatus({ status: 'running', stage: currentStage, selectedCount: selected.length });
 
+    const postOutcomes = [];
+
     for (let i = 0; i < selected.length; i += 1) {
       const candidate = selected[i];
-      console.log(`[collect ${i + 1}/${selected.length}] ${candidate.canonicalUrl} score=${candidate.relevance.score}`);
-      await page.goto(candidate.canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-      await randomPause(config, 1.4);
-      const expansion = await expandPost(page, candidate.postId, config, options.testSortSwitch);
-      const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars, expansion);
-      const normalized = normalizeBundle(candidate, bundle, config);
+      console.log(`\n[collect ${i + 1}/${selected.length}] ${candidate.canonicalUrl} score=${candidate.relevance.score}`);
 
-      await fs.writeFile(path.join(rawDir, `${candidate.postId}.json`), JSON.stringify({
-        source: candidate,
-        capturedAt: normalized.capturedAt,
-        pageUrl: bundle.pageUrl,
-        rootSelection: bundle.rootSelection ?? null,
-        expansion: bundle.expansion ?? null,
-        raw: bundle.raw,
-      }, null, 2));
-      await fs.writeFile(path.join(normalizedDir, `${candidate.postId}.json`), JSON.stringify(normalized, null, 2));
-      await fs.writeFile(path.join(normalizedDir, `${candidate.postId}.md`), toMarkdown(normalized));
-      collected.push(normalized);
-      await randomPause(config, 1.3);
+      let attempt = 0;
+      let postSuccess = false;
+      let lastError = null;
+      let outcomeData = null;
+
+      while (attempt < 2 && !postSuccess) {
+        attempt += 1;
+        try {
+          await page.goto(candidate.canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+          await randomPause(config, 1.4);
+          const expansion = await expandPost(page, candidate.postId, config, options.testSortSwitch);
+          const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars, expansion);
+          const normalized = normalizeBundle(candidate, bundle, config);
+
+          await fs.writeFile(path.join(rawDir, `${candidate.postId}.json`), JSON.stringify({
+            source: candidate,
+            capturedAt: normalized.capturedAt,
+            pageUrl: bundle.pageUrl,
+            rootSelection: bundle.rootSelection ?? null,
+            expansion: bundle.expansion ?? null,
+            raw: bundle.raw,
+          }, null, 2));
+          await fs.writeFile(path.join(normalizedDir, `${candidate.postId}.json`), JSON.stringify(normalized, null, 2));
+          await fs.writeFile(path.join(normalizedDir, `${candidate.postId}.md`), toMarkdown(normalized));
+          collected.push(normalized);
+
+          outcomeData = {
+            postId: candidate.postId,
+            url: candidate.canonicalUrl,
+            author: normalized.post.author ?? 'Unknown',
+            commentsCount: normalized.comments.length,
+            status: expansion.completeness === 'complete' ? 'complete' : 'truncated',
+            completionReason: expansion.completionReason,
+            truncationReason: expansion.truncationReason,
+          };
+          postSuccess = true;
+          await randomPause(config, 1.3);
+        } catch (err) {
+          lastError = err;
+          if (attempt < 2) {
+            console.warn(`[retry 1/1] Post ${candidate.postId} encountered error: ${err?.message ?? err}. Retrying in 3s...`);
+            await new Promise((r) => setTimeout(r, 3000));
+          }
+        }
+      }
+
+      if (!postSuccess) {
+        console.error(`[failed] Post ${candidate.postId} failed after ${attempt} attempts: ${lastError?.message ?? lastError}`);
+        outcomeData = {
+          postId: candidate.postId,
+          url: candidate.canonicalUrl,
+          author: null,
+          commentsCount: 0,
+          status: 'failed',
+          error: lastError?.message ?? String(lastError),
+        };
+      }
+
+      postOutcomes.push(outcomeData);
     }
 
+    const completeCount = postOutcomes.filter((o) => o.status === 'complete').length;
+    const truncatedCount = postOutcomes.filter((o) => o.status === 'truncated').length;
+    const failedCount = postOutcomes.filter((o) => o.status === 'failed').length;
+    const skippedCount = Math.max(0, ranked.length - selected.length);
+    const incompletePosts = postOutcomes.filter((o) => o.status !== 'complete');
+
+    const reconciliation = {
+      topic: options.query ?? (config.queries.length === 1 ? config.queries[0] : 'all'),
+      discovered: candidates.length,
+      relevant: ranked.length,
+      attempted: selected.length,
+      complete: completeCount,
+      truncated: truncatedCount,
+      failed: failedCount,
+      skipped: skippedCount,
+      incompletePosts,
+      postOutcomes,
+    };
+
+    await fs.writeFile(path.join(runDir, 'reconciliation.json'), JSON.stringify(reconciliation, null, 2));
     await fs.writeFile(path.join(runDir, 'dataset.json'), JSON.stringify(collected, null, 2));
+
+    console.log(`\n==================================================`);
+    console.log(`TOPIC RECONCILIATION: "${reconciliation.topic}"`);
+    console.log(`==================================================`);
+    console.log(`Discovered:  ${reconciliation.discovered}`);
+    console.log(`Relevant:    ${reconciliation.relevant}`);
+    console.log(`Attempted:   ${reconciliation.attempted}`);
+    console.log(`Complete:    ${reconciliation.complete}`);
+    console.log(`Truncated:   ${reconciliation.truncated}`);
+    console.log(`Failed:      ${reconciliation.failed}`);
+    console.log(`Skipped:     ${reconciliation.skipped}`);
+    if (incompletePosts.length > 0) {
+      console.log(`\nIncomplete posts:`);
+      for (const p of incompletePosts) {
+        console.log(`- ${p.postId} (${p.url}): ${p.status} - ${p.truncationReason || p.error || p.completionReason}`);
+      }
+    }
+    console.log(`==================================================\n`);
+
     await writeRunStatus({
-      status: 'completed',
+      status: failedCount > 0 ? 'completed-with-errors' : 'completed',
       completedAt: new Date().toISOString(),
       stage: 'done',
       records: collected.length,
+      reconciliation,
       mode: 'discovery-and-collect',
     });
 
-    console.log(`\nDone. Local output: ${runDir}`);
+    console.log(`Done. Local output: ${runDir}`);
   } catch (err) {
     await writeRunStatus({
       status: 'failed',
