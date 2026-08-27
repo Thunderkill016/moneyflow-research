@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  atomicWriteJson,
   cacheCompleteRecord,
   findCorpusRecord,
   findNearDuplicate,
@@ -77,6 +78,7 @@ test('full-body filter keeps PFM core and rejects obvious unrelated gaming conte
   const game = classifyFullBody({ body: 'Indie game chiến thuật theo lượt, quản lý tài nguyên và cloud gaming cho nhiều thiết bị.', query: 'quản lý chi tiêu', relevance, topicFilter });
   assert.notEqual(pfm.classification, 'out-of-topic');
   assert.equal(game.classification, 'out-of-topic');
+  assert.equal(game.decision, 'HARD-REJECT');
   assert.equal(shouldCollectComments(game.classification, topicFilter), false);
 });
 
@@ -99,4 +101,77 @@ test('corpus index and normalized cache survive atomic round trip', async () => 
   const loaded = await loadCachedRecord(indexPath, loadedRegistry.posts[record.sourceKey]);
   assert.equal(loaded.source.postId, '42');
   assert.equal(loaded.comments.length, 1);
+});
+
+test('uncertain long content is REVIEW-COLLECT instead of silent out-of-topic exclusion', () => {
+  const topicFilter = {
+    inTopicThreshold: 9,
+    adjacentThreshold: 3,
+    hardRejectMinNegativeScore: 8,
+    minBodyChars: 80,
+    commentClasses: ['in-topic', 'adjacent', 'ambiguous'],
+    anchors: [{ term: 'quản lý chi tiêu', weight: 6, strong: true }],
+    negativeAnchors: [{ term: 'cloud gaming', weight: 9 }],
+  };
+  const relevance = { threshold: 5, include: [{ term: 'chi tiêu', weight: 3 }], exclude: [] };
+  const result = classifyFullBody({
+    body: 'Mình đang thử một workflow mới để giảm số bước thao tác và theo dõi mọi thứ hằng ngày. Hiện vẫn đang thử nghiệm và cần thêm phản hồi.',
+    query: 'quản lý chi tiêu',
+    relevance,
+    topicFilter,
+  });
+  assert.equal(result.classification, 'ambiguous');
+  assert.equal(result.decision, 'REVIEW-COLLECT');
+  assert.equal(result.reason, 'insufficient-evidence-to-hard-reject');
+  assert.equal(shouldCollectComments(result.classification, topicFilter), true);
+});
+
+test('hard reject requires clear negative evidence and no strong PFM evidence', () => {
+  const topicFilter = {
+    inTopicThreshold: 9,
+    adjacentThreshold: 3,
+    hardRejectMinNegativeScore: 8,
+    commentClasses: ['in-topic', 'adjacent', 'ambiguous'],
+    anchors: [
+      { term: 'quản lý chi tiêu', weight: 6, strong: true },
+      { term: 'ngân sách', weight: 4, strong: true },
+    ],
+    negativeAnchors: [
+      { term: 'cloud gaming', weight: 9 },
+      { term: 'game', weight: 5 },
+    ],
+  };
+  const relevance = { threshold: 5, include: [{ term: 'chi tiêu', weight: 3 }], exclude: [] };
+  const unrelated = classifyFullBody({
+    body: 'Nền tảng cloud gaming mới giúp chơi game trên nhiều thiết bị.',
+    query: 'quản lý chi tiêu', relevance, topicFilter,
+  });
+  assert.equal(unrelated.decision, 'HARD-REJECT');
+  assert.equal(unrelated.classification, 'out-of-topic');
+  assert.equal(shouldCollectComments(unrelated.classification, topicFilter), false);
+
+  const mixed = classifyFullBody({
+    body: 'App quản lý chi tiêu có mini game để tạo thói quen và theo dõi ngân sách.',
+    query: 'quản lý chi tiêu', relevance, topicFilter,
+  });
+  assert.notEqual(mixed.decision, 'HARD-REJECT');
+  assert.ok(mixed.strongHits >= 1);
+});
+
+test('topic matcher respects token boundaries for short negative terms', () => {
+  const topicFilter = {
+    inTopicThreshold: 9,
+    adjacentThreshold: 3,
+    hardRejectMinNegativeScore: 8,
+    commentClasses: ['in-topic', 'adjacent', 'ambiguous'],
+    anchors: [{ term: 'quản lý chi tiêu', weight: 6, strong: true }],
+    negativeAnchors: [{ term: 'pos', weight: 9 }],
+  };
+  const relevance = { threshold: 5, include: [{ term: 'chi tiêu', weight: 3 }], exclude: [] };
+  const result = classifyFullBody({
+    body: 'Post này chia sẻ một app quản lý chi tiêu cá nhân.',
+    query: 'quản lý chi tiêu', relevance, topicFilter,
+  });
+  assert.equal(result.matchedNegative.some((item) => item.term === 'pos'), false);
+  assert.notEqual(result.decision, 'HARD-REJECT');
 });
