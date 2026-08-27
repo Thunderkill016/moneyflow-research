@@ -295,11 +295,12 @@ async function discover(page, config) {
 }
 
 async function expandPost(page, postId, config) {
-  return page.evaluate(async ({ postId, maxRounds, maxClicksPerRound, expandRegexesSrc }) => {
-    const EXPAND_REGEXES = expandRegexesSrc.map((src) => new RegExp(src, 'i'));
-    const isExpandText = (text) => EXPAND_REGEXES.some((re) => re.test(text));
+  const maxRounds = config.collection.expandRounds ?? 80;
+  const maxClicksPerRound = config.collection.maxClicksPerRound ?? 30;
+  const tolerance = 80;
 
-    // 1. Detect active post surface
+  // 1. Detect post surface & switch sort mode to All comments
+  const initInfo = await page.evaluate(({ postId }) => {
     const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
     const matchingDialog = dialogs.find((d) => {
       if (!d.offsetParent && d.offsetWidth === 0 && d.offsetHeight === 0) return false;
@@ -312,7 +313,7 @@ async function expandPost(page, postId, config) {
     const surface = matchingDialog || document.querySelector('[role="main"]') || document.querySelector('main') || document.body;
     const surfaceType = matchingDialog ? 'dialog' : (document.querySelector('[role="main"]') || document.querySelector('main') ? 'main' : 'body');
 
-    // 2. Switch comment sort mode to "Tất cả bình luận" / "All comments" if available
+    // Switch comment sort to All comments if possible
     const sortResult = (() => {
       const sortButton = [...surface.querySelectorAll('button, [role="button"], div[tabindex]')].find((el) => {
         const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
@@ -326,57 +327,73 @@ async function expandPost(page, postId, config) {
       return { initial: allBtn ? 'Tất cả bình luận' : 'unknown', final: allBtn ? 'Tất cả bình luận' : 'unknown', switched: false };
     })();
 
-    // 3. Determine the actual scroll container INSIDE that post surface
-    const findScrollContainer = (root) => {
-      const candidates = [];
-      const elements = [root, ...root.querySelectorAll('*')];
-      for (const el of elements) {
-        const style = window.getComputedStyle(el);
-        const isScrollStyle = (style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 20;
-        const articleCount = el.querySelectorAll('[role="article"]').length;
-        if (isScrollStyle) {
-          candidates.push({
-            el,
-            reason: `overflow-${style.overflowY}-with-scrollDiff-${el.scrollHeight - el.clientHeight}`,
-            articleCount,
-            scrollHeight: el.scrollHeight,
-            clientHeight: el.clientHeight,
-          });
+    return { surfaceType, commentSort: sortResult };
+  }, { postId });
+
+  let prevArticles = 0;
+  let prevScrollHeight = 0;
+  let bottomIdleRounds = 0;
+  let failedScrollAssertion = false;
+  let completionReason = '';
+  const roundLogs = [];
+  const clickedByLabel = {};
+  const initialWindowScrollY = await page.evaluate(() => window.scrollY);
+
+  for (let round = 1; round <= maxRounds; round += 1) {
+    const stepResult = await page.evaluate(async ({ postId, maxClicksPerRound, expandRegexesSrc, tolerance, initialWindowScrollY }) => {
+      const EXPAND_REGEXES = expandRegexesSrc.map((src) => new RegExp(src, 'i'));
+      const isExpandText = (text) => EXPAND_REGEXES.some((re) => re.test(text));
+
+      const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
+      const matchingDialog = dialogs.find((d) => {
+        if (!d.offsetParent && d.offsetWidth === 0 && d.offsetHeight === 0) return false;
+        const text = d.innerText || '';
+        return text.includes(postId) || !!d.querySelector(`a[href*="${postId}"]`);
+      }) || dialogs.find((d) => {
+        return d.querySelectorAll('[role="article"]').length > 0 && (d.offsetHeight > 200 || (d.innerText || '').length > 200);
+      }) || null;
+
+      const surface = matchingDialog || document.querySelector('[role="main"]') || document.querySelector('main') || document.body;
+
+      const findScrollContainer = (root) => {
+        const candidates = [];
+        const elements = [root, ...root.querySelectorAll('*')];
+        for (const el of elements) {
+          const style = window.getComputedStyle(el);
+          const isScrollStyle = (style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 20;
+          const articleCount = el.querySelectorAll('[role="article"]').length;
+          if (isScrollStyle) {
+            candidates.push({
+              el,
+              reason: `overflow-${style.overflowY}-with-scrollDiff-${el.scrollHeight - el.clientHeight}`,
+              articleCount,
+              scrollHeight: el.scrollHeight,
+              clientHeight: el.clientHeight,
+            });
+          }
         }
-      }
-      candidates.sort((a, b) => b.articleCount - a.articleCount || b.scrollHeight - a.scrollHeight);
-      return candidates[0] || {
-        el: root,
-        reason: 'surface-fallback',
-        articleCount: root.querySelectorAll('[role="article"]').length,
-        scrollHeight: root.scrollHeight,
-        clientHeight: root.clientHeight,
+        candidates.sort((a, b) => b.articleCount - a.articleCount || b.scrollHeight - a.scrollHeight);
+        return candidates[0] || {
+          el: root,
+          reason: 'surface-fallback',
+          articleCount: root.querySelectorAll('[role="article"]').length,
+          scrollHeight: root.scrollHeight,
+          clientHeight: root.clientHeight,
+        };
       };
-    };
 
-    const scrollInfo = findScrollContainer(surface);
-    const container = scrollInfo.el;
+      const scrollInfo = findScrollContainer(surface);
+      const container = scrollInfo.el;
 
-    const isVisible = (el) => {
-      const style = window.getComputedStyle(el);
-      return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && (el.offsetWidth > 0 || el.offsetHeight > 0);
-    };
+      const isVisible = (el) => {
+        const style = window.getComputedStyle(el);
+        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && (el.offsetWidth > 0 || el.offsetHeight > 0);
+      };
 
-    const roundLogs = [];
-    const clickedByLabel = {};
-    let prevArticles = surface.querySelectorAll('[role="article"]').length;
-    let prevScrollHeight = container.scrollHeight;
-    let bottomIdleRounds = 0;
-    let failedScrollAssertion = false;
-    const tolerance = 80;
-
-    const initialWindowScrollY = window.scrollY;
-
-    for (let round = 0; round < maxRounds; round += 1) {
       const prevScrollTop = container.scrollTop;
       const clickedThisRound = [];
 
-      // 4. Fixed-point expansion sweep at current scroll position
+      // Multi-pass expansion at current scroll position
       let sweepPass = 0;
       while (sweepPass < 4) {
         sweepPass += 1;
@@ -396,26 +413,20 @@ async function expandPost(page, postId, config) {
             btn.scrollIntoView({ block: 'nearest' });
             btn.click();
             clickedThisRound.push(text);
-            clickedByLabel[text] = (clickedByLabel[text] || 0) + 1;
             clickedInPass += 1;
             await new Promise((r) => setTimeout(r, 450));
-          } catch {
-            // Dynamic re-renders may invalidate nodes
-          }
+          } catch {}
         }
         if (clickedInPass === 0) break;
       }
 
-      // 5. Scroll only the post's internal scroll container towards bottom
+      // Scroll container down
       const scrollStep = Math.max(300, Math.round((container.clientHeight || 500) * 0.75));
       container.scrollTop += scrollStep;
       await new Promise((r) => setTimeout(r, 1200));
 
-      // 6. Assert background feed isolation
       const currentWindowScrollY = window.scrollY;
-      if (Math.abs(currentWindowScrollY - initialWindowScrollY) > 50 && container.scrollTop === prevScrollTop) {
-        failedScrollAssertion = true;
-      }
+      const scrollFailed = Math.abs(currentWindowScrollY - initialWindowScrollY) > 50 && container.scrollTop === prevScrollTop;
 
       const currArticles = surface.querySelectorAll('[role="article"]').length;
       const currScrollHeight = container.scrollHeight;
@@ -424,11 +435,7 @@ async function expandPost(page, postId, config) {
       const remainingPx = Math.max(0, currScrollHeight - (container.scrollTop + clientHeight));
       const atBottom = remainingPx <= tolerance;
 
-      const newBlocks = currArticles > prevArticles;
-      const heightIncreased = currScrollHeight > prevScrollHeight + 20;
-
-      const roundData = {
-        round: round + 1,
+      return {
         scrollTop: container.scrollTop,
         scrollHeight: currScrollHeight,
         clientHeight,
@@ -436,66 +443,116 @@ async function expandPost(page, postId, config) {
         remainingPx,
         atBottom,
         visibleArticles: currArticles,
-        clickedCount: clickedThisRound.length,
-        clickedTexts: clickedThisRound.slice(0, 8),
-        newBlocksAppeared: newBlocks,
-        scrollHeightIncreased: heightIncreased,
+        clickedTexts: clickedThisRound,
+        scrollFailed,
         windowScrollY: currentWindowScrollY,
+        scrollContainerReason: scrollInfo.reason,
       };
-      roundLogs.push(roundData);
+    }, {
+      postId,
+      maxClicksPerRound,
+      expandRegexesSrc: EXPAND_REGEXES.map((re) => re.source),
+      tolerance,
+      initialWindowScrollY,
+    });
 
-      // 7. Bottom-Aware Completion criterion:
-      // Only count idle rounds toward convergence when AT THE BOTTOM.
-      if (atBottom) {
-        if (clickedThisRound.length === 0 && !newBlocks && !heightIncreased) {
-          bottomIdleRounds += 1;
-        } else {
-          bottomIdleRounds = 0;
-        }
+    if (stepResult.scrollFailed) failedScrollAssertion = true;
+
+    for (const text of stepResult.clickedTexts) {
+      clickedByLabel[text] = (clickedByLabel[text] || 0) + 1;
+    }
+
+    const newBlocks = stepResult.visibleArticles > prevArticles;
+    const heightIncreased = stepResult.scrollHeight > prevScrollHeight + 20;
+
+    const roundData = {
+      round,
+      scrollTop: stepResult.scrollTop,
+      scrollHeight: stepResult.scrollHeight,
+      clientHeight: stepResult.clientHeight,
+      maxScrollTop: stepResult.maxScrollTop,
+      remainingPx: stepResult.remainingPx,
+      atBottom: stepResult.atBottom,
+      visibleArticles: stepResult.visibleArticles,
+      clickedCount: stepResult.clickedTexts.length,
+      clickedTexts: stepResult.clickedTexts.slice(0, 8),
+      newBlocksAppeared: newBlocks,
+      scrollHeightIncreased: heightIncreased,
+      windowScrollY: stepResult.windowScrollY,
+      scrollContainerReason: stepResult.scrollContainerReason,
+    };
+    roundLogs.push(roundData);
+
+    if (stepResult.atBottom) {
+      if (stepResult.clickedTexts.length === 0 && !newBlocks && !heightIncreased) {
+        bottomIdleRounds += 1;
       } else {
         bottomIdleRounds = 0;
       }
-
-      prevArticles = currArticles;
-      prevScrollHeight = currScrollHeight;
-
-      if (bottomIdleRounds >= 3) break;
+    } else {
+      bottomIdleRounds = 0;
     }
 
-    // 8. Find suspicious unmatched buttons
+    console.log(`[post] round=${round} comments=${stepResult.visibleArticles} new=${stepResult.visibleArticles - prevArticles} [scroll] scrollTop=${stepResult.scrollTop} scrollHeight=${stepResult.scrollHeight} remainingPx=${stepResult.remainingPx} atBottom=${stepResult.atBottom} [expand] clicked=${stepResult.clickedTexts.length} [stableBottom]=${bottomIdleRounds}`);
+
+    prevArticles = stepResult.visibleArticles;
+    prevScrollHeight = stepResult.scrollHeight;
+
+    if (bottomIdleRounds >= 3) {
+      completionReason = 'bottom-stable';
+      break;
+    }
+  }
+
+  if (!completionReason) {
+    completionReason = 'safety-cap';
+  }
+
+  const completeness = completionReason === 'bottom-stable' ? 'complete' : 'truncated';
+  console.log(`\n[post] COMPLETE comments=${prevArticles} reason=${completionReason} completeness=${completeness}`);
+
+  // Scan suspicious unmatched controls
+  const suspiciousUnmatched = await page.evaluate(({ expandRegexesSrc }) => {
+    const EXPAND_REGEXES = expandRegexesSrc.map((src) => new RegExp(src, 'i'));
+    const isExpandText = (text) => EXPAND_REGEXES.some((re) => re.test(text));
+    const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
+    const surface = dialogs[0] || document.querySelector('[role="main"]') || document.body;
+    const isVisible = (el) => {
+      const style = window.getComputedStyle(el);
+      return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && (el.offsetWidth > 0 || el.offsetHeight > 0);
+    };
     const allButtons = [...surface.querySelectorAll('button, a, [role="button"]')].filter(isVisible);
-    const suspiciousUnmatched = [];
+    const suspicious = [];
     for (const btn of allButtons) {
       const text = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
       if (text.length > 0 && text.length < 80 && !isExpandText(text)) {
         const lower = text.toLowerCase();
         if (['bình luận', 'phản hồi', 'câu trả lời', 'comment', 'reply', 'replies', 'xem thêm', 'see more'].some((k) => lower.includes(k))) {
           if (!['bình luận', 'viết bình luận công khai…', 'viết phản hồi công khai…', 'tất cả bình luận', 'phù hợp nhất', 'all comments', 'most relevant'].includes(lower) && !/^\d+\s*bình luận$/i.test(text)) {
-            suspiciousUnmatched.push(text);
+            suspicious.push(text);
           }
         }
       }
     }
+    return suspicious;
+  }, { expandRegexesSrc: EXPAND_REGEXES.map((re) => re.source) });
 
-    return {
-      surfaceType,
-      scrollContainerReason: scrollInfo.reason,
-      failedScrollAssertion,
-      commentSort: sortResult,
-      totalRounds: roundLogs.length,
-      finalArticles: surface.querySelectorAll('[role="article"]').length,
-      finalRemainingPx: roundLogs[roundLogs.length - 1]?.remainingPx ?? 0,
-      finalAtBottom: roundLogs[roundLogs.length - 1]?.atBottom ?? false,
-      clickedByLabel,
-      suspiciousUnmatched,
-      roundLogs,
-    };
-  }, {
-    postId,
-    maxRounds: config.collection.expandRounds ?? 18,
-    maxClicksPerRound: config.collection.maxClicksPerRound ?? 25,
-    expandRegexesSrc: EXPAND_REGEXES.map((re) => re.source),
-  });
+  return {
+    surfaceType: initInfo.surfaceType,
+    scrollContainerReason: roundLogs[0]?.scrollContainerReason ?? 'detected-container',
+    failedScrollAssertion,
+    commentSort: initInfo.commentSort,
+    totalRounds: roundLogs.length,
+    completionReason,
+    completeness,
+    truncationReason: completeness === 'truncated' ? 'safety-cap' : null,
+    finalArticles: prevArticles,
+    finalRemainingPx: roundLogs[roundLogs.length - 1]?.remainingPx ?? 0,
+    finalAtBottom: roundLogs[roundLogs.length - 1]?.atBottom ?? false,
+    clickedByLabel,
+    suspiciousUnmatched,
+    roundLogs,
+  };
 }
 
 async function extractPostBundle(page, postId, rawHtmlMaxChars, expansion = null) {
