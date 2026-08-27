@@ -30,6 +30,7 @@ export function parseCli(rawArgs = process.argv.slice(2)) {
       'discovery-only': { type: 'boolean', default: false },
       'post-url': { type: 'string' },
       'post-id': { type: 'string' },
+      'test-sort-switch': { type: 'boolean', default: false },
     },
   });
 
@@ -50,6 +51,7 @@ export function parseCli(rawArgs = process.argv.slice(2)) {
     discoveryOnly: Boolean(values['discovery-only']),
     postUrl: values['post-url'] ?? null,
     postId: values['post-id'] ?? null,
+    testSortSwitch: Boolean(values['test-sort-switch']),
   };
 }
 
@@ -294,7 +296,7 @@ async function discover(page, config) {
   return { candidates: rankedCandidates, discoveryDiagnostics };
 }
 
-async function switchCommentSortToAllComments(page, postId) {
+async function switchCommentSortToAllComments(page, postId, testSortSwitch = false) {
   try {
     const dialogs = page.locator('[role="dialog"], [aria-modal="true"]');
     const dialogCount = await dialogs.count();
@@ -310,7 +312,7 @@ async function switchCommentSortToAllComments(page, postId) {
       }
     }
 
-    const findTrigger = await surface.evaluate((root) => {
+    let findTrigger = await surface.evaluate((root) => {
       const clickables = [...root.querySelectorAll('button, [role="button"], div[aria-haspopup="menu"], div[tabindex]')];
       for (const el of clickables) {
         const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
@@ -325,75 +327,128 @@ async function switchCommentSortToAllComments(page, postId) {
     });
 
     if (!findTrigger.found) {
-      return { initial: 'unknown', final: 'unknown', switched: false };
+      console.log(`[sort] Comment sort trigger not found on surface.`);
+      return { initial: 'unknown', final: 'unknown', switched: false, verified: false };
+    }
+
+    // If testSortSwitch is requested and we are already in All comments, reset to Phù hợp nhất first
+    if (testSortSwitch && findTrigger.isAll) {
+      console.log(`[sort] Resetting to "Phù hợp nhất" for live transition test...`);
+      const triggerLoc = surface.locator('div[role="button"][aria-haspopup="menu"], [role="button"], button').filter({
+        hasText: /phù hợp nhất|most relevant|tất cả bình luận|all comments|bình luận hàng đầu|top comments|mới nhất|newest/i,
+      }).first();
+      await triggerLoc.scrollIntoViewIfNeeded().catch(() => {});
+      await triggerLoc.click({ timeout: 5000 });
+      await page.waitForTimeout(1000);
+      const mostRelOpt = page.locator('[role="menuitem"], [role="menuitemradio"]').filter({
+        hasText: /phù hợp nhất|most relevant/i,
+      }).first();
+      if (await mostRelOpt.isVisible().catch(() => false)) {
+        await mostRelOpt.click({ timeout: 5000 });
+        await page.waitForTimeout(2500);
+        const recheckInitial = await surface.evaluate((root) => {
+          const clickables = [...root.querySelectorAll('button, [role="button"], div[aria-haspopup="menu"], div[tabindex]')];
+          for (const el of clickables) {
+            const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (/^(?:phù hợp nhất|most relevant|bình luận hàng đầu|top comments|mới nhất|newest)$/i.test(text)) {
+              return { found: true, text, isAll: false };
+            }
+          }
+          return null;
+        });
+        if (recheckInitial) findTrigger = recheckInitial;
+      }
     }
 
     if (findTrigger.isAll) {
-      console.log(`[sort] Comment sort already in All comments mode: "${findTrigger.text}"`);
-      return { initial: findTrigger.text, final: findTrigger.text, switched: false };
+      console.log(`[sort] initial="${findTrigger.text}" (already in All comments mode) switched=false verified=true`);
+      return { initial: findTrigger.text, final: findTrigger.text, switched: false, verified: true };
     }
 
-    console.log(`[sort] Found comment sort button: "${findTrigger.text}". Clicking to switch to "Tất cả bình luận"...`);
+    console.log(`[sort] initial="${findTrigger.text}"`);
 
-    const triggerLocator = surface.locator('button, [role="button"], div[aria-haspopup="menu"], div[tabindex]').filter({
-      hasText: new RegExp(`^${findTrigger.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i'),
+    const triggerLocator = surface.locator('div[role="button"][aria-haspopup="menu"], [role="button"], button').filter({
+      hasText: /phù hợp nhất|most relevant|tất cả bình luận|all comments|bình luận hàng đầu|top comments|mới nhất|newest/i,
     }).first();
 
     await triggerLocator.scrollIntoViewIfNeeded().catch(() => {});
     await triggerLocator.click({ timeout: 5000 });
+    console.log(`[sort] clicked trigger`);
     await page.waitForTimeout(1000);
 
-    const menuOption = page.locator('[role="menuitem"], [role="menuitemradio"], [role="button"], div[tabindex], span').filter({
+    const menuOption = page.locator('[role="menuitem"], [role="menuitemradio"]').filter({
       hasText: /tất cả bình luận|all comments/i,
     });
 
     const optionCount = await menuOption.count();
+    let clicked = false;
     if (optionCount > 0) {
-      let clicked = false;
       for (let i = 0; i < optionCount; i += 1) {
         const opt = menuOption.nth(i);
         if (await opt.isVisible().catch(() => false)) {
           await opt.click({ timeout: 5000 });
           clicked = true;
-          console.log(`[sort] Clicked "Tất cả bình luận" menu option.`);
+          console.log(`[sort] clicked "Tất cả bình luận"`);
           break;
         }
       }
-      if (clicked) {
-        await page.waitForTimeout(2500);
-        const recheckText = await surface.evaluate((root) => {
-          const clickables = [...root.querySelectorAll('button, [role="button"], div[aria-haspopup="menu"], div[tabindex]')];
-          for (const el of clickables) {
-            const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-            if (/^(?:tất cả bình luận|all comments|phù hợp nhất|most relevant)$/i.test(text)) {
-              return text;
-            }
+    }
+
+    if (clicked) {
+      await page.waitForTimeout(2500);
+      const recheckText = await surface.evaluate((root) => {
+        const clickables = [...root.querySelectorAll('button, [role="button"], div[aria-haspopup="menu"], div[tabindex]')];
+        for (const el of clickables) {
+          const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (/^(?:tất cả bình luận|all comments|phù hợp nhất|most relevant|mới nhất|newest)$/i.test(text)) {
+            return text;
           }
-          return null;
-        });
+        }
+        return null;
+      });
+
+      if (recheckText && /^(?:tất cả bình luận|all comments)$/i.test(recheckText)) {
+        console.log(`[sort] final="${recheckText}" switched=true verified=true`);
         return {
           initial: findTrigger.text,
-          final: recheckText || 'Tất cả bình luận',
+          final: recheckText,
           switched: true,
+          verified: true,
+        };
+      } else if (recheckText) {
+        console.warn(`[sort] final="${recheckText}" switched=false verified=false (still in "${recheckText}")`);
+        return {
+          initial: findTrigger.text,
+          final: recheckText,
+          switched: false,
+          verified: false,
+        };
+      } else {
+        console.warn(`[sort] final="unverified" switched=false verified=false (recheck returned null)`);
+        return {
+          initial: findTrigger.text,
+          final: 'unverified',
+          switched: false,
+          verified: false,
         };
       }
     }
 
-    console.warn(`[sort] Menu opened but "Tất cả bình luận" option was not found/clickable.`);
-    return { initial: findTrigger.text, final: findTrigger.text, switched: false };
+    console.warn(`[sort] Menu opened but "Tất cả bình luận" option was not clickable.`);
+    return { initial: findTrigger.text, final: findTrigger.text, switched: false, verified: false };
   } catch (err) {
     console.warn(`[sort] Failed to switch comment sort: ${err?.message ?? err}`);
-    return { initial: 'error', final: 'error', switched: false, error: err?.message };
+    return { initial: 'error', final: 'error', switched: false, verified: false, error: err?.message };
   }
 }
 
-async function expandPost(page, postId, config) {
+async function expandPost(page, postId, config, testSortSwitch = false) {
   const maxRounds = config.collection.expandRounds ?? 80;
   const maxClicksPerRound = config.collection.maxClicksPerRound ?? 30;
   const tolerance = 80;
 
   // 1. Detect post surface & actively switch sort mode to "Tất cả bình luận"
-  const commentSort = await switchCommentSortToAllComments(page, postId);
+  const commentSort = await switchCommentSortToAllComments(page, postId, testSortSwitch);
 
   const initInfo = await page.evaluate(({ postId }) => {
     const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
@@ -1034,7 +1089,7 @@ async function collect(config, options = {}) {
       console.log(`\n[direct-post] Bypassing discovery. Opening target post: ${candidate.canonicalUrl}`);
       await page.goto(candidate.canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
       await randomPause(config, 1.4);
-      const expansion = await expandPost(page, candidate.postId, config);
+      const expansion = await expandPost(page, candidate.postId, config, options.testSortSwitch);
       const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars, expansion);
       const normalized = normalizeBundle(candidate, bundle, config);
 
@@ -1110,7 +1165,7 @@ async function collect(config, options = {}) {
       console.log(`[collect ${i + 1}/${selected.length}] ${candidate.canonicalUrl} score=${candidate.relevance.score}`);
       await page.goto(candidate.canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
       await randomPause(config, 1.4);
-      const expansion = await expandPost(page, candidate.postId, config);
+      const expansion = await expandPost(page, candidate.postId, config, options.testSortSwitch);
       const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars, expansion);
       const normalized = normalizeBundle(candidate, bundle, config);
 
