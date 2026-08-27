@@ -43,6 +43,12 @@ test('removes common Facebook UI-only lines conservatively', () => {
   assert.equal(text, 'Có quản lý nhiều tài khoản không?');
 });
 
+test('cleans concatenated author age and action chrome from live Facebook DOM text', () => {
+  const raw = 'Thái Duy Anh · 9 tuầnVẫn là app thu chi mà có đầu tư tư duy nghiên cứu chức năng vào như này nó khác liền.ThíchTrả lờiChia sẻ1';
+  const text = cleanFacebookText(raw, 'Thái Duy Anh');
+  assert.equal(text, 'Vẫn là app thu chi mà có đầu tư tư duy nghiên cứu chức năng vào như này nó khác liền.');
+});
+
 test('comment fingerprints are deterministic', () => {
   const input = { postKey: 'facebook:g:1', author: 'A', text: '50k ăn sáng', parentFingerprint: '' };
   assert.equal(fingerprintComment(input), fingerprintComment(input));
