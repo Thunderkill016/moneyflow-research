@@ -218,3 +218,38 @@ test('isSuspiciousUnmatchedButton identifies unrecognized comment/reply buttons 
   assert.equal(isSuspiciousUnmatchedButton('Viết bình luận công khai…'), false);
 });
 
+// --- CLI Option Validation & Strictness tests ---
+
+test('parseCli parses single query and discovery-only flags accurately', async () => {
+  const { parseCli } = await import('../src/index.mjs');
+  const result = parseCli(['collect', '--config', 'custom.json', '--query', 'quản lý chi tiêu', '--discovery-only']);
+  assert.equal(result.command, 'collect');
+  assert.equal(result.config, 'custom.json');
+  assert.equal(result.query, 'quản lý chi tiêu');
+  assert.equal(result.discoveryOnly, true);
+  assert.equal(result.postUrl, null);
+});
+
+test('parseCli parses direct post-url and post-id flags accurately', async () => {
+  const { parseCli } = await import('../src/index.mjs');
+  const result = parseCli(['collect', '--post-url', 'https://www.facebook.com/groups/1569314343856132/permalink/2186835792103981/']);
+  assert.equal(result.command, 'collect');
+  assert.equal(result.postUrl, 'https://www.facebook.com/groups/1569314343856132/permalink/2186835792103981/');
+  assert.equal(result.discoveryOnly, false);
+});
+
+test('parseCli throws on unknown CLI option', async () => {
+  const { parseCli } = await import('../src/index.mjs');
+  assert.throws(() => {
+    parseCli(['collect', '--unknown-argument']);
+  }, /Unknown option/);
+});
+
+test('parseCli throws on invalid --limit value', async () => {
+  const { parseCli } = await import('../src/index.mjs');
+  assert.throws(() => {
+    parseCli(['collect', '--limit', 'invalid']);
+  }, /Invalid --limit value/);
+});
+
+

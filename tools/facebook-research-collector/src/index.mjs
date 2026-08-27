@@ -3,6 +3,7 @@ import path from 'node:path';
 import process from 'node:process';
 import readline from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
+import { parseArgs as utilParseArgs } from 'node:util';
 import { chromium } from 'playwright';
 import {
   EXPAND_REGEXES,
@@ -17,21 +18,39 @@ import {
   uniqueBy,
 } from './core.mjs';
 
-function parseArgs(argv) {
-  const result = {
-    command: argv[2] ?? '',
-    config: 'config.json',
-    limit: null,
-    query: null,
-    discoveryOnly: false,
-  };
-  for (let i = 3; i < argv.length; i += 1) {
-    if (argv[i] === '--config' && argv[i + 1]) result.config = argv[++i];
-    else if (argv[i] === '--limit' && argv[i + 1]) result.limit = Number(argv[++i]);
-    else if (argv[i] === '--query' && argv[i + 1]) result.query = argv[++i];
-    else if (argv[i] === '--discovery-only') result.discoveryOnly = true;
+export function parseCli(rawArgs = process.argv.slice(2)) {
+  const { values, positionals } = utilParseArgs({
+    args: rawArgs,
+    allowPositionals: true,
+    strict: true,
+    options: {
+      config: { type: 'string', default: 'config.json' },
+      limit: { type: 'string' },
+      query: { type: 'string' },
+      'discovery-only': { type: 'boolean', default: false },
+      'post-url': { type: 'string' },
+      'post-id': { type: 'string' },
+    },
+  });
+
+  const command = positionals[0] ?? '';
+  let limit = null;
+  if (values.limit) {
+    limit = Number.parseInt(values.limit, 10);
+    if (!Number.isFinite(limit) || limit <= 0) {
+      throw new Error(`Invalid --limit value: "${values.limit}". Must be a positive integer.`);
+    }
   }
-  return result;
+
+  return {
+    command,
+    config: values.config ?? 'config.json',
+    limit,
+    query: values.query ?? null,
+    discoveryOnly: Boolean(values['discovery-only']),
+    postUrl: values['post-url'] ?? null,
+    postId: values['post-id'] ?? null,
+  };
 }
 
 async function loadConfig(configArg, cliQuery = null) {
@@ -809,7 +828,7 @@ function toMarkdown(record) {
   return lines.join('\n');
 }
 
-async function collect(config, cliLimit, discoveryOnly = false) {
+async function collect(config, options = {}) {
   const runDir = resolveConfigPath(config, path.join(config.collection.outputDir, timestampSlug()));
   const rawDir = path.join(runDir, 'raw');
   const normalizedDir = path.join(runDir, 'normalized');
@@ -827,7 +846,13 @@ async function collect(config, cliLimit, discoveryOnly = false) {
       startedAt,
       group: config.group,
       queries: config.queries,
-      discoveryOnly: Boolean(discoveryOnly),
+      options: {
+        query: options.query ?? null,
+        discoveryOnly: Boolean(options.discoveryOnly),
+        postUrl: options.postUrl ?? null,
+        postId: options.postId ?? null,
+        limit: options.limit ?? null,
+      },
       note: 'Local research evidence. Do not commit raw Facebook dumps or browser profile data.',
       ...fields,
     }, null, 2));
@@ -838,6 +863,69 @@ async function collect(config, cliLimit, discoveryOnly = false) {
   const { context, page } = await openContext(config);
   const collected = [];
   try {
+    // Mode 3: Direct Post Mode (Bypasses discovery completely)
+    if (options.postUrl || options.postId) {
+      currentStage = 'direct-post';
+      await writeRunStatus({ status: 'running', stage: currentStage });
+
+      let candidate = null;
+      if (options.postUrl) {
+        const canonical = canonicalizeFacebookPostUrl(options.postUrl, config.group.id);
+        if (!canonical) throw new Error(`Invalid Facebook post URL: "${options.postUrl}"`);
+        candidate = {
+          ...canonical,
+          preview: '',
+          queries: options.query ? [options.query] : [],
+          discoveredUrls: [options.postUrl],
+          relevance: { score: 10, matched: [], threshold: 5, relevant: true },
+        };
+      } else {
+        const canonicalUrl = `https://www.facebook.com/groups/${config.group.id}/permalink/${options.postId}/`;
+        candidate = {
+          groupId: config.group.id,
+          postId: options.postId,
+          canonicalUrl,
+          key: `facebook:${config.group.id}:${options.postId}`,
+          preview: '',
+          queries: options.query ? [options.query] : [],
+          discoveredUrls: [canonicalUrl],
+          relevance: { score: 10, matched: [], threshold: 5, relevant: true },
+        };
+      }
+
+      console.log(`\n[direct-post] Bypassing discovery. Opening target post: ${candidate.canonicalUrl}`);
+      await page.goto(candidate.canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+      await randomPause(config, 1.4);
+      const expansion = await expandPost(page, candidate.postId, config);
+      const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars, expansion);
+      const normalized = normalizeBundle(candidate, bundle, config);
+
+      await fs.writeFile(path.join(rawDir, `${candidate.postId}.json`), JSON.stringify({
+        source: candidate,
+        capturedAt: normalized.capturedAt,
+        pageUrl: bundle.pageUrl,
+        rootSelection: bundle.rootSelection ?? null,
+        expansion: bundle.expansion ?? null,
+        raw: bundle.raw,
+      }, null, 2));
+      await fs.writeFile(path.join(normalizedDir, `${candidate.postId}.json`), JSON.stringify(normalized, null, 2));
+      await fs.writeFile(path.join(normalizedDir, `${candidate.postId}.md`), toMarkdown(normalized));
+      collected.push(normalized);
+
+      await fs.writeFile(path.join(runDir, 'dataset.json'), JSON.stringify(collected, null, 2));
+      await writeRunStatus({
+        status: 'completed',
+        completedAt: new Date().toISOString(),
+        stage: 'done',
+        records: 1,
+        mode: 'direct-post',
+      });
+
+      console.log(`\n[direct-post] Complete. Saved 1 post to: ${runDir}`);
+      return;
+    }
+
+    // Mode 1 & Mode 2: Search Discovery
     currentStage = 'discovery';
     await writeRunStatus({ status: 'running', stage: currentStage });
 
@@ -855,7 +943,8 @@ async function collect(config, cliLimit, discoveryOnly = false) {
       candidates: candidates.map((item) => ({ ...item, relevance: item.relevance })),
     }, null, 2));
 
-    if (discoveryOnly) {
+    // Mode 2: Discovery Only
+    if (options.discoveryOnly) {
       await writeRunStatus({
         status: 'completed',
         completedAt: new Date().toISOString(),
@@ -863,12 +952,14 @@ async function collect(config, cliLimit, discoveryOnly = false) {
         records: 0,
         candidateCount: candidates.length,
         relevantCount: ranked.length,
+        mode: 'discovery-only',
       });
       console.log(`\n[discovery-only] Complete. Candidates: ${candidates.length}, Relevant: ${ranked.length}. Local output: ${runDir}`);
       return;
     }
 
-    const maxPosts = Number.isFinite(cliLimit) && cliLimit > 0 ? cliLimit : config.collection.maxPosts;
+    // Mode 1: Search + Collect Top Posts
+    const maxPosts = Number.isFinite(options.limit) && options.limit > 0 ? options.limit : config.collection.maxPosts;
     const selected = ranked.slice(0, maxPosts);
 
     console.log(`\n[select] ${candidates.length} candidates, ${ranked.length} relevant, collecting ${selected.length}`);
@@ -905,6 +996,7 @@ async function collect(config, cliLimit, discoveryOnly = false) {
       completedAt: new Date().toISOString(),
       stage: 'done',
       records: collected.length,
+      mode: 'discovery-and-collect',
     });
 
     console.log(`\nDone. Local output: ${runDir}`);
@@ -928,20 +1020,22 @@ async function collect(config, cliLimit, discoveryOnly = false) {
 }
 
 async function main() {
-  const args = parseArgs(process.argv);
-  if (!['login', 'collect'].includes(args.command)) {
-    console.error('Usage: node src/index.mjs <login|collect> [--config config.json] [--limit N] [--query "query string"] [--discovery-only]');
+  const cli = parseCli(process.argv.slice(2));
+  if (!['login', 'collect'].includes(cli.command)) {
+    console.error('Usage: node src/index.mjs <login|collect> [--config config.json] [--limit N] [--query "topic"] [--discovery-only] [--post-url <url>] [--post-id <id>]');
     process.exitCode = 2;
     return;
   }
 
-  const config = await loadConfig(args.config, args.query);
-  if (args.command === 'login') await login(config);
-  else await collect(config, args.limit, args.discoveryOnly);
+  const config = await loadConfig(cli.config, cli.query);
+  if (cli.command === 'login') await login(config);
+  else await collect(config, cli);
 }
 
-main().catch((error) => {
-  console.error(error?.stack ?? error);
-  process.exitCode = 1;
-});
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  main().catch((error) => {
+    console.error(error?.stack ?? error);
+    process.exitCode = 1;
+  });
+}
 
