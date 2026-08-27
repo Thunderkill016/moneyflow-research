@@ -5,38 +5,49 @@ import readline from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 import {
+  EXPAND_REGEXES,
   canonicalizeFacebookPostUrl,
   cleanFacebookPostText,
   cleanFacebookText,
   fingerprintComment,
+  isExpandButtonText,
+  isSuspiciousUnmatchedButton,
   normalizeWhitespace,
   scoreRelevance,
   uniqueBy,
 } from './core.mjs';
 
-const EXPAND_TEXT = /^(xem thêm|see more|xem thêm bình luận|view more comments|xem thêm .* bình luận|xem thêm phản hồi|view more replies|xem .* câu trả lời|view .* replies|xem các bình luận trước|view previous comments)$/i;
-
 function parseArgs(argv) {
-  const result = { command: argv[2] ?? '', config: 'config.json', limit: null };
+  const result = {
+    command: argv[2] ?? '',
+    config: 'config.json',
+    limit: null,
+    query: null,
+    discoveryOnly: false,
+  };
   for (let i = 3; i < argv.length; i += 1) {
     if (argv[i] === '--config' && argv[i + 1]) result.config = argv[++i];
     else if (argv[i] === '--limit' && argv[i + 1]) result.limit = Number(argv[++i]);
+    else if (argv[i] === '--query' && argv[i + 1]) result.query = argv[++i];
+    else if (argv[i] === '--discovery-only') result.discoveryOnly = true;
   }
   return result;
 }
 
-async function loadConfig(configArg) {
+async function loadConfig(configArg, cliQuery = null) {
   const configPath = path.resolve(process.cwd(), configArg);
   const parsed = JSON.parse(await fs.readFile(configPath, 'utf8'));
   const baseDir = path.dirname(configPath);
 
   if (!parsed.group?.id) throw new Error('config.group.id is required');
-  if (!Array.isArray(parsed.queries) || parsed.queries.length === 0) throw new Error('config.queries must contain at least one query');
+  const queries = cliQuery ? [cliQuery] : parsed.queries;
+  if (!Array.isArray(queries) || queries.length === 0) throw new Error('config.queries must contain at least one query');
 
   return {
     ...parsed,
     _configPath: configPath,
     _baseDir: baseDir,
+    queries,
     browser: {
       headless: false,
       profileDir: './profile',
@@ -49,17 +60,17 @@ async function loadConfig(configArg) {
       ...parsed.pacing,
     },
     discovery: {
-      scrollRounds: 6,
-      scrollPixels: 1400,
-      maxCandidatesPerQuery: 40,
+      safetyCapRounds: 90,
+      scrollPixels: 1500,
+      maxCandidatesPerQuery: 500,
       ...parsed.discovery,
     },
     collection: {
       maxPosts: 25,
-      expandRounds: 10,
-      maxClicksPerRound: 20,
+      expandRounds: 40,
+      maxClicksPerRound: 30,
       outputDir: './output',
-      rawHtmlMaxChars: 1_500_000,
+      rawHtmlMaxChars: 2_000_000,
       ...parsed.collection,
     },
     relevance: {
@@ -137,14 +148,30 @@ async function extractDiscoveryCandidates(page, fallbackGroupId) {
 
 async function discover(page, config) {
   const candidates = new Map();
+  const discoveryDiagnostics = [];
 
   for (const query of config.queries) {
-    console.log(`\n[discover] ${query}`);
-    await page.goto(searchUrl(config.group.id, query), { waitUntil: 'domcontentloaded' });
+    console.log(`\n[discover] query="${query}"`);
+    try {
+      await page.goto(searchUrl(config.group.id, query), { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    } catch {
+      await randomPause(config, 2);
+      await page.goto(searchUrl(config.group.id, query), { waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(() => {});
+    }
     await randomPause(config, 1.5);
 
-    for (let round = 0; round < config.discovery.scrollRounds; round += 1) {
+    const safetyCapRounds = config.discovery.safetyCapRounds ?? 90;
+    const scrollPixels = config.discovery.scrollPixels ?? 1500;
+    const tolerance = 100;
+    let stableBottomRounds = 0;
+    let prevScrollHeight = 0;
+    let completionReason = '';
+    const roundLogs = [];
+
+    for (let round = 1; round <= safetyCapRounds; round += 1) {
       const rows = await extractDiscoveryCandidates(page, config.group.id);
+      let newThisRound = 0;
+
       for (const row of rows) {
         const canonical = canonicalizeFacebookPostUrl(row.href, config.group.id);
         if (!canonical) continue;
@@ -156,32 +183,104 @@ async function discover(page, config) {
             queries: new Set([query]),
             discoveredUrls: new Set([row.href]),
           });
+          newThisRound += 1;
         } else {
           existing.queries.add(query);
           existing.discoveredUrls.add(row.href);
-          if ((row.preview?.length ?? 0) > (existing.preview?.length ?? 0)) existing.preview = normalizeWhitespace(row.preview);
+          if ((row.preview?.length ?? 0) > (existing.preview?.length ?? 0)) {
+            existing.preview = normalizeWhitespace(row.preview);
+          }
         }
       }
 
-      const perQuery = [...candidates.values()].filter((item) => item.queries.has(query)).length;
-      console.log(`[discover] round ${round + 1}: ${perQuery} unique candidates for query`);
-      if (perQuery >= config.discovery.maxCandidatesPerQuery) break;
-      await page.mouse.wheel(0, config.discovery.scrollPixels);
-      await randomPause(config);
+      const metrics = await page.evaluate(() => {
+        const el = document.scrollingElement || document.body;
+        const scrollTop = window.scrollY || el.scrollTop || 0;
+        const scrollHeight = el.scrollHeight;
+        const clientHeight = window.innerHeight || el.clientHeight;
+        const remainingPx = Math.max(0, scrollHeight - (scrollTop + clientHeight));
+        return { scrollTop, scrollHeight, clientHeight, remainingPx };
+      });
+
+      const atBottom = metrics.remainingPx <= tolerance;
+      const heightIncreased = metrics.scrollHeight > prevScrollHeight + 20;
+
+      if (atBottom) {
+        if (newThisRound === 0 && !heightIncreased) {
+          stableBottomRounds += 1;
+        } else {
+          stableBottomRounds = 0;
+        }
+      } else {
+        stableBottomRounds = 0;
+      }
+
+      const queryCandidatesCount = [...candidates.values()].filter((item) => item.queries.has(query)).length;
+
+      const logEntry = {
+        round,
+        candidates: queryCandidatesCount,
+        newThisRound,
+        scrollTop: metrics.scrollTop,
+        scrollHeight: metrics.scrollHeight,
+        clientHeight: metrics.clientHeight,
+        remainingPx: metrics.remainingPx,
+        atBottom,
+        heightIncreased,
+        stableBottomRounds,
+      };
+      roundLogs.push(logEntry);
+
+      console.log(`round=${round} candidates=${queryCandidatesCount} new=${newThisRound} atBottom=${atBottom} remainingPx=${metrics.remainingPx} scrollHeight=${metrics.scrollHeight} stable=${stableBottomRounds}`);
+
+      if (stableBottomRounds >= 3) {
+        completionReason = 'bottom-stable';
+        break;
+      }
+
+      prevScrollHeight = metrics.scrollHeight;
+
+      // Scroll down
+      await page.evaluate((step) => window.scrollBy(0, step), scrollPixels);
+      await randomPause(config, 0.7);
     }
+
+    if (!completionReason) {
+      completionReason = 'safety-cap';
+    }
+
+    const queryCandidatesCount = [...candidates.values()].filter((item) => item.queries.has(query)).length;
+    const completeness = completionReason === 'bottom-stable' ? 'complete' : 'truncated';
+    console.log(`\n[discover] COMPLETE query="${query}" candidates=${queryCandidatesCount} reason=${completionReason} completeness=${completeness}`);
+
+    discoveryDiagnostics.push({
+      query,
+      candidatesCount: queryCandidatesCount,
+      totalRounds: roundLogs.length,
+      completionReason,
+      completeness,
+      truncationReason: completeness === 'truncated' ? 'safety-cap' : null,
+      lastMetrics: roundLogs[roundLogs.length - 1] ?? null,
+      roundLogs,
+    });
   }
 
-  return [...candidates.values()].map((item) => ({
+  const rankedCandidates = [...candidates.values()].map((item) => ({
     ...item,
     queries: [...item.queries],
     discoveredUrls: [...item.discoveredUrls],
     relevance: scoreRelevance(item.preview, config.relevance),
   }));
+
+  return { candidates: rankedCandidates, discoveryDiagnostics };
 }
 
 async function expandPost(page, postId, config) {
-  return page.evaluate(async ({ postId, maxRounds, maxClicksPerRound }) => {
-    // 1. Detect post surface
+  return page.evaluate(async ({ postId, maxRounds, maxClicksPerRound, expandRegexesSrc }) => {
+    const EXPAND_REGEXES = expandRegexesSrc.map((src) => new RegExp(src, 'i'));
+    const isExpandText = (text) => EXPAND_REGEXES.some((re) => re.test(text));
+
+    // 1. Detect active post surface
     const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
     const matchingDialog = dialogs.find((d) => {
       if (!d.offsetParent && d.offsetWidth === 0 && d.offsetHeight === 0) return false;
@@ -194,7 +293,21 @@ async function expandPost(page, postId, config) {
     const surface = matchingDialog || document.querySelector('[role="main"]') || document.querySelector('main') || document.body;
     const surfaceType = matchingDialog ? 'dialog' : (document.querySelector('[role="main"]') || document.querySelector('main') ? 'main' : 'body');
 
-    // 2. Determine the actual scroll container INSIDE that post surface
+    // 2. Switch comment sort mode to "Tất cả bình luận" / "All comments" if available
+    const sortResult = (() => {
+      const sortButton = [...surface.querySelectorAll('button, [role="button"], div[tabindex]')].find((el) => {
+        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        return /^(?:phù hợp nhất|most relevant|bình luận hàng đầu|top comments)$/i.test(text);
+      });
+      if (sortButton) return { initial: (sortButton.innerText || '').trim(), final: 'Phù hợp nhất', switched: false };
+      const allBtn = [...surface.querySelectorAll('button, [role="button"], div[tabindex]')].find((el) => {
+        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        return /^(?:tất cả bình luận|all comments)$/i.test(text);
+      });
+      return { initial: allBtn ? 'Tất cả bình luận' : 'unknown', final: allBtn ? 'Tất cả bình luận' : 'unknown', switched: false };
+    })();
+
+    // 3. Determine the actual scroll container INSIDE that post surface
     const findScrollContainer = (root) => {
       const candidates = [];
       const elements = [root, ...root.querySelectorAll('*')];
@@ -225,43 +338,61 @@ async function expandPost(page, postId, config) {
     const scrollInfo = findScrollContainer(surface);
     const container = scrollInfo.el;
 
+    const isVisible = (el) => {
+      const style = window.getComputedStyle(el);
+      return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && (el.offsetWidth > 0 || el.offsetHeight > 0);
+    };
+
     const roundLogs = [];
+    const clickedByLabel = {};
     let prevArticles = surface.querySelectorAll('[role="article"]').length;
     let prevScrollHeight = container.scrollHeight;
-    let idleRounds = 0;
+    let bottomIdleRounds = 0;
     let failedScrollAssertion = false;
+    const tolerance = 80;
 
     const initialWindowScrollY = window.scrollY;
 
     for (let round = 0; round < maxRounds; round += 1) {
       const prevScrollTop = container.scrollTop;
+      const clickedThisRound = [];
 
-      // 3. Scope ALL expansion controls strictly to the selected post surface
-      const clickables = [...surface.querySelectorAll('button, a, [role="button"]')];
-      const matchingButtons = clickables.filter((el) => {
-        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-        return /^(xem thêm|see more|xem thêm bình luận|view more comments|xem thêm .* bình luận|xem thêm phản hồi|view more replies|xem .* câu trả lời|view .* replies|xem các bình luận trước|view previous comments)$/i.test(text);
-      });
+      // 4. Fixed-point expansion sweep at current scroll position
+      let sweepPass = 0;
+      while (sweepPass < 4) {
+        sweepPass += 1;
+        const clickables = [...surface.querySelectorAll('button, a, [role="button"]')];
+        const eligible = clickables.filter((el) => {
+          if (!isVisible(el)) return false;
+          const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+          return isExpandText(text);
+        });
 
-      const clickedTexts = [];
-      for (let i = 0; i < matchingButtons.length && clickedTexts.length < maxClicksPerRound; i += 1) {
-        const btn = matchingButtons[i];
-        const text = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
-        try {
-          btn.click();
-          clickedTexts.push(text);
-          await new Promise((r) => setTimeout(r, 450));
-        } catch {
-          // Dynamic re-renders may invalidate nodes
+        if (eligible.length === 0) break;
+        let clickedInPass = 0;
+        for (const btn of eligible) {
+          if (clickedThisRound.length >= maxClicksPerRound) break;
+          const text = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
+          try {
+            btn.scrollIntoView({ block: 'nearest' });
+            btn.click();
+            clickedThisRound.push(text);
+            clickedByLabel[text] = (clickedByLabel[text] || 0) + 1;
+            clickedInPass += 1;
+            await new Promise((r) => setTimeout(r, 450));
+          } catch {
+            // Dynamic re-renders may invalidate nodes
+          }
         }
+        if (clickedInPass === 0) break;
       }
 
-      // 4. Scroll only the post's internal scroll container
+      // 5. Scroll only the post's internal scroll container towards bottom
       const scrollStep = Math.max(300, Math.round((container.clientHeight || 500) * 0.75));
       container.scrollTop += scrollStep;
       await new Promise((r) => setTimeout(r, 1200));
 
-      // 7. Background scroll assertion: if background feed moved while post container didn't scroll
+      // 6. Assert background feed isolation
       const currentWindowScrollY = window.scrollY;
       if (Math.abs(currentWindowScrollY - initialWindowScrollY) > 50 && container.scrollTop === prevScrollTop) {
         failedScrollAssertion = true;
@@ -269,49 +400,82 @@ async function expandPost(page, postId, config) {
 
       const currArticles = surface.querySelectorAll('[role="article"]').length;
       const currScrollHeight = container.scrollHeight;
+      const clientHeight = container.clientHeight;
+      const maxScrollTop = Math.max(0, currScrollHeight - clientHeight);
+      const remainingPx = Math.max(0, currScrollHeight - (container.scrollTop + clientHeight));
+      const atBottom = remainingPx <= tolerance;
+
       const newBlocks = currArticles > prevArticles;
-      const heightIncreased = currScrollHeight > prevScrollHeight;
+      const heightIncreased = currScrollHeight > prevScrollHeight + 20;
 
       const roundData = {
         round: round + 1,
         scrollTop: container.scrollTop,
         scrollHeight: currScrollHeight,
-        clientHeight: container.clientHeight,
+        clientHeight,
+        maxScrollTop,
+        remainingPx,
+        atBottom,
         visibleArticles: currArticles,
-        matchingControls: matchingButtons.length,
-        clickedCount: clickedTexts.length,
-        clickedTexts: clickedTexts.slice(0, 8),
+        clickedCount: clickedThisRound.length,
+        clickedTexts: clickedThisRound.slice(0, 8),
         newBlocksAppeared: newBlocks,
         scrollHeightIncreased: heightIncreased,
         windowScrollY: currentWindowScrollY,
       };
       roundLogs.push(roundData);
 
-      // 6. Completion criterion: stop after 2 consecutive rounds of no clicks, no new blocks, and no scroll expansion
-      if (clickedTexts.length === 0 && !newBlocks && !heightIncreased) {
-        idleRounds += 1;
+      // 7. Bottom-Aware Completion criterion:
+      // Only count idle rounds toward convergence when AT THE BOTTOM.
+      if (atBottom) {
+        if (clickedThisRound.length === 0 && !newBlocks && !heightIncreased) {
+          bottomIdleRounds += 1;
+        } else {
+          bottomIdleRounds = 0;
+        }
       } else {
-        idleRounds = 0;
+        bottomIdleRounds = 0;
       }
 
       prevArticles = currArticles;
       prevScrollHeight = currScrollHeight;
 
-      if (idleRounds >= 2) break;
+      if (bottomIdleRounds >= 3) break;
+    }
+
+    // 8. Find suspicious unmatched buttons
+    const allButtons = [...surface.querySelectorAll('button, a, [role="button"]')].filter(isVisible);
+    const suspiciousUnmatched = [];
+    for (const btn of allButtons) {
+      const text = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
+      if (text.length > 0 && text.length < 80 && !isExpandText(text)) {
+        const lower = text.toLowerCase();
+        if (['bình luận', 'phản hồi', 'câu trả lời', 'comment', 'reply', 'replies', 'xem thêm', 'see more'].some((k) => lower.includes(k))) {
+          if (!['bình luận', 'viết bình luận công khai…', 'viết phản hồi công khai…', 'tất cả bình luận', 'phù hợp nhất', 'all comments', 'most relevant'].includes(lower) && !/^\d+\s*bình luận$/i.test(text)) {
+            suspiciousUnmatched.push(text);
+          }
+        }
+      }
     }
 
     return {
       surfaceType,
       scrollContainerReason: scrollInfo.reason,
       failedScrollAssertion,
+      commentSort: sortResult,
       totalRounds: roundLogs.length,
       finalArticles: surface.querySelectorAll('[role="article"]').length,
+      finalRemainingPx: roundLogs[roundLogs.length - 1]?.remainingPx ?? 0,
+      finalAtBottom: roundLogs[roundLogs.length - 1]?.atBottom ?? false,
+      clickedByLabel,
+      suspiciousUnmatched,
       roundLogs,
     };
   }, {
     postId,
-    maxRounds: config.collection.expandRounds ?? 10,
-    maxClicksPerRound: config.collection.maxClicksPerRound ?? 20,
+    maxRounds: config.collection.expandRounds ?? 18,
+    maxClicksPerRound: config.collection.maxClicksPerRound ?? 25,
+    expandRegexesSrc: EXPAND_REGEXES.map((re) => re.source),
   });
 }
 
@@ -645,7 +809,7 @@ function toMarkdown(record) {
   return lines.join('\n');
 }
 
-async function collect(config, cliLimit) {
+async function collect(config, cliLimit, discoveryOnly = false) {
   const runDir = resolveConfigPath(config, path.join(config.collection.outputDir, timestampSlug()));
   const rawDir = path.join(runDir, 'raw');
   const normalizedDir = path.join(runDir, 'normalized');
@@ -663,6 +827,7 @@ async function collect(config, cliLimit) {
       startedAt,
       group: config.group,
       queries: config.queries,
+      discoveryOnly: Boolean(discoveryOnly),
       note: 'Local research evidence. Do not commit raw Facebook dumps or browser profile data.',
       ...fields,
     }, null, 2));
@@ -676,21 +841,35 @@ async function collect(config, cliLimit) {
     currentStage = 'discovery';
     await writeRunStatus({ status: 'running', stage: currentStage });
 
-    const candidates = await discover(page, config);
+    const { candidates, discoveryDiagnostics } = await discover(page, config);
     const ranked = candidates
       .filter((item) => item.relevance.relevant)
       .sort((a, b) => b.relevance.score - a.relevance.score || b.preview.length - a.preview.length);
-    const maxPosts = Number.isFinite(cliLimit) && cliLimit > 0 ? cliLimit : config.collection.maxPosts;
-    const selected = ranked.slice(0, maxPosts);
 
     await fs.writeFile(path.join(runDir, 'discovery.json'), JSON.stringify({
       group: config.group,
       queries: config.queries,
       candidateCount: candidates.length,
       relevantCount: ranked.length,
-      selectedCount: selected.length,
+      discoveryDiagnostics,
       candidates: candidates.map((item) => ({ ...item, relevance: item.relevance })),
     }, null, 2));
+
+    if (discoveryOnly) {
+      await writeRunStatus({
+        status: 'completed',
+        completedAt: new Date().toISOString(),
+        stage: 'discovery-complete',
+        records: 0,
+        candidateCount: candidates.length,
+        relevantCount: ranked.length,
+      });
+      console.log(`\n[discovery-only] Complete. Candidates: ${candidates.length}, Relevant: ${ranked.length}. Local output: ${runDir}`);
+      return;
+    }
+
+    const maxPosts = Number.isFinite(cliLimit) && cliLimit > 0 ? cliLimit : config.collection.maxPosts;
+    const selected = ranked.slice(0, maxPosts);
 
     console.log(`\n[select] ${candidates.length} candidates, ${ranked.length} relevant, collecting ${selected.length}`);
 
@@ -700,7 +879,7 @@ async function collect(config, cliLimit) {
     for (let i = 0; i < selected.length; i += 1) {
       const candidate = selected[i];
       console.log(`[collect ${i + 1}/${selected.length}] ${candidate.canonicalUrl} score=${candidate.relevance.score}`);
-      await page.goto(candidate.canonicalUrl, { waitUntil: 'domcontentloaded' });
+      await page.goto(candidate.canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
       await randomPause(config, 1.4);
       const expansion = await expandPost(page, candidate.postId, config);
       const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars, expansion);
@@ -751,17 +930,18 @@ async function collect(config, cliLimit) {
 async function main() {
   const args = parseArgs(process.argv);
   if (!['login', 'collect'].includes(args.command)) {
-    console.error('Usage: node src/index.mjs <login|collect> [--config config.json] [--limit N]');
+    console.error('Usage: node src/index.mjs <login|collect> [--config config.json] [--limit N] [--query "query string"] [--discovery-only]');
     process.exitCode = 2;
     return;
   }
 
-  const config = await loadConfig(args.config);
+  const config = await loadConfig(args.config, args.query);
   if (args.command === 'login') await login(config);
-  else await collect(config, args.limit);
+  else await collect(config, args.limit, args.discoveryOnly);
 }
 
 main().catch((error) => {
   console.error(error?.stack ?? error);
   process.exitCode = 1;
 });
+

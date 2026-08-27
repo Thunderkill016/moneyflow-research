@@ -209,3 +209,40 @@ export function uniqueBy(items, keyFn) {
   }
   return [...map.values()];
 }
+
+export const EXPAND_REGEXES = [
+  // Xem thêm / See more
+  /^(?:xem thêm|see more)$/i,
+  // Xem thêm [N] bình luận / View [N] more comments / View more comments / Hiển thị thêm bình luận / Show more comments
+  /^(?:xem thêm|view more|hiển thị thêm|show more)(?:\s+\d+)?\s+(?:bình luận|comments?)(?:\s+trước|\s+khác|\s+nữa)?$/i,
+  /^(?:view|show)\s+(?:\d+\s+)?more\s+comments?$/i,
+  // Xem các bình luận trước / View previous comments / Xem [N] bình luận trước
+  /^(?:xem|view)\s+(?:các|\d+)?\s*(?:bình luận trước|previous comments?)$/i,
+  // Xem thêm [N] phản hồi / View [N] more replies / Xem [N] phản hồi / View [N] replies
+  /^(?:xem thêm|view more|xem|view)(?:\s+\d+)?\s+(?:phản hồi|replies|reply)(?:\s+trước|\s+khác|\s+nữa)?$/i,
+  /^(?:view|show)\s+(?:\d+\s+)?more\s+replies$/i,
+  // Xem thêm [N] câu trả lời / View [N] more replies / Xem [N] câu trả lời
+  /^(?:xem thêm|view more|xem|view)(?:\s+\d+)?\s+(?:câu trả lời|replies|reply)(?:\s+trước|\s+khác|\s+nữa)?$/i,
+  // Xem [N] câu trả lời khác / Xem [N] bình luận khác / Xem [N] phản hồi khác
+  /^(?:xem|view)\s+\d+\s+(?:câu trả lời|bình luận|phản hồi)\s+(?:khác|nữa)$/i,
+  // [N] phản hồi / [N] câu trả lời
+  /^\d+\s+(?:phản hồi|câu trả lời|replies?)(?:\s+khác)?$/i,
+];
+
+export function isExpandButtonText(text = '') {
+  const norm = normalizeWhitespace(text);
+  if (!norm || norm.length > 80) return false;
+  return EXPAND_REGEXES.some((re) => re.test(norm));
+}
+
+export function isSuspiciousUnmatchedButton(text = '') {
+  const norm = normalizeWhitespace(text);
+  if (!norm || norm.length > 80) return false;
+  if (isExpandButtonText(norm)) return false;
+  const lower = norm.toLowerCase();
+  const keywords = ['bình luận', 'phản hồi', 'câu trả lời', 'comment', 'reply', 'replies', 'xem thêm', 'see more'];
+  const ignored = ['bình luận', 'viết bình luận công khai…', 'viết phản hồi công khai…', 'tất cả bình luận', 'phù hợp nhất', 'all comments', 'most relevant'];
+  if (ignored.includes(lower)) return false;
+  return keywords.some((k) => lower.includes(k));
+}
+

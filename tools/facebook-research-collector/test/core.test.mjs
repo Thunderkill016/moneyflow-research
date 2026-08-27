@@ -6,6 +6,8 @@ import {
   cleanFacebookText,
   fingerprintComment,
   isCommentPermalink,
+  isExpandButtonText,
+  isSuspiciousUnmatchedButton,
   scoreRelevance,
 } from '../src/core.mjs';
 
@@ -160,3 +162,59 @@ test('cleanFacebookPostText strips dialog headers, Facebook noise, and public gr
   const result = cleanFacebookPostText(raw, 'Hà Bảo Khanh');
   assert.equal(result, 'Chào anh chị em BIP VN, đây là app Finny.');
 });
+
+// --- Expansion buttons & convergence tests ---
+
+test('isExpandButtonText matches all common Vietnamese and English variations', () => {
+  const cases = [
+    'Xem thêm',
+    'See more',
+    'Xem thêm bình luận',
+    'View more comments',
+    'Xem thêm 3 bình luận',
+    'View 3 more comments',
+    'Hiển thị thêm bình luận',
+    'Show more comments',
+    'Xem các bình luận trước',
+    'View previous comments',
+    'Xem thêm phản hồi',
+    'View more replies',
+    'Xem thêm 3 phản hồi',
+    'View 3 more replies',
+    'Xem 2 phản hồi',
+    'View 2 replies',
+    'Xem thêm câu trả lời',
+    'Xem thêm 5 câu trả lời',
+    'Xem 2 câu trả lời',
+    'Xem 4 câu trả lời',
+    'Xem 1 câu trả lời',
+    'Xem 3 câu trả lời khác',
+    'Xem 2 bình luận khác',
+    '2 phản hồi',
+    '4 câu trả lời',
+  ];
+
+  for (const text of cases) {
+    assert.equal(isExpandButtonText(text), true, `Expected "${text}" to match isExpandButtonText`);
+  }
+
+  // Non-expand controls must return false
+  assert.equal(isExpandButtonText('Thích'), false);
+  assert.equal(isExpandButtonText('Trả lời'), false);
+  assert.equal(isExpandButtonText('Chia sẻ'), false);
+  assert.equal(isExpandButtonText('Tất cả bình luận'), false);
+  assert.equal(isExpandButtonText('Phù hợp nhất'), false);
+  assert.equal(isExpandButtonText('Viết bình luận công khai…'), false);
+});
+
+test('isSuspiciousUnmatchedButton identifies unrecognized comment/reply buttons without false positives on standard controls', () => {
+  assert.equal(isSuspiciousUnmatchedButton('Xem danh sách phản hồi chưa đọc'), true);
+  assert.equal(isSuspiciousUnmatchedButton('Tải lại bình luận'), true);
+  // Standard expand buttons already matched -> false
+  assert.equal(isSuspiciousUnmatchedButton('Xem 2 câu trả lời'), false);
+  // Standard UI buttons -> false
+  assert.equal(isSuspiciousUnmatchedButton('Tất cả bình luận'), false);
+  assert.equal(isSuspiciousUnmatchedButton('Phù hợp nhất'), false);
+  assert.equal(isSuspiciousUnmatchedButton('Viết bình luận công khai…'), false);
+});
+
