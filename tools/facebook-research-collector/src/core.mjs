@@ -89,9 +89,23 @@ const UI_ONLY_LINES = [
   /^(theo dõi|follow)$/i,
 ];
 
+function escapeRegExp(value = '') {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 export function cleanFacebookText(raw = '', author = '') {
   const authorNorm = normalizeWhitespace(author);
-  const lines = String(raw)
+  let working = String(raw).replace(/\u00a0/g, ' ').trim();
+
+  // Facebook sometimes exposes textContent without visual separators, producing
+  // strings such as "Author · 9 tuầnBody...ThíchTrả lờiChia sẻ1".
+  if (authorNorm) working = working.replace(new RegExp(`^${escapeRegExp(authorNorm)}\\s*`, 'i'), '');
+  working = working
+    .replace(/^\s*·?\s*(?:\d+\s*(?:phút|phut|giờ|gio|ngày|ngay|tuần|tuan|tháng|thang|năm|nam)|vừa xong|just now)\s*/i, '')
+    .replace(/\s*(?:Thích|Like)\s*(?:Trả lời|Reply)\s*(?:Chia sẻ|Share)\s*\d*\s*$/i, '')
+    .trim();
+
+  const lines = working
     .split(/\r?\n/)
     .map((line) => normalizeWhitespace(line))
     .filter(Boolean)
