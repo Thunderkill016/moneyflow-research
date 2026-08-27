@@ -11,6 +11,7 @@
     "login": "node src/index.mjs login",
     "collect": "node src/topic-runner.mjs collect",
     "collect:legacy": "node src/index.mjs collect",
+    "corpus:import": "node src/import-run.mjs",
     "test": "node --test"
   },
   "dependencies": {
