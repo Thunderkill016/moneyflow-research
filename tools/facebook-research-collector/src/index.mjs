@@ -31,6 +31,9 @@ export function parseCli(rawArgs = process.argv.slice(2)) {
       'post-url': { type: 'string' },
       'post-id': { type: 'string' },
       'test-sort-switch': { type: 'boolean', default: false },
+      'from-discovery': { type: 'string' },
+      resume: { type: 'boolean', default: false },
+      'output-dir': { type: 'string' },
     },
   });
 
@@ -52,6 +55,9 @@ export function parseCli(rawArgs = process.argv.slice(2)) {
     postUrl: values['post-url'] ?? null,
     postId: values['post-id'] ?? null,
     testSortSwitch: Boolean(values['test-sort-switch']),
+    fromDiscovery: values['from-discovery'] ?? null,
+    resume: Boolean(values.resume),
+    outputDir: values['output-dir'] ?? null,
   };
 }
 
@@ -261,9 +267,19 @@ async function discover(page, config) {
 
       prevScrollHeight = metrics.scrollHeight;
 
-      // Scroll down
-      await page.evaluate((step) => window.scrollBy(0, step), scrollPixels);
-      await randomPause(config, 0.7);
+      // Dynamic fast scroll towards bottom
+      const scrollStep = Math.max(3000, Math.round((metrics.clientHeight || 900) * 2.5));
+      await page.evaluate((step) => window.scrollBy(0, step), scrollStep);
+
+      // Reactive wait for DOM update (scrollHeight change or new link elements)
+      await page.waitForFunction(
+        (prev) => {
+          const el = document.scrollingElement || document.body;
+          return el.scrollHeight > prev + 40;
+        },
+        metrics.scrollHeight,
+        { timeout: 650 }
+      ).catch(() => {});
     }
 
     if (!completionReason) {
@@ -395,7 +411,34 @@ async function switchCommentSortToAllComments(page, postId, testSortSwitch = fal
     }
 
     if (clicked) {
-      await page.waitForTimeout(2500);
+      // Reactive wait for sort text to change to 'Tất cả bình luận'
+      const recheckResult = await page.waitForFunction(() => {
+        const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
+        const matchingDialog = dialogs.find((d) => {
+          if (!d.offsetParent && d.offsetWidth === 0 && d.offsetHeight === 0) return false;
+          const text = d.innerText || '';
+          return text.includes('bình luận') || text.includes('comments') || d.querySelectorAll('[role="article"]').length > 0;
+        }) || document.querySelector('[role="main"]') || document.body;
+
+        const clickables = [...matchingDialog.querySelectorAll('button, [role="button"], div[aria-haspopup="menu"], div[tabindex]')];
+        for (const el of clickables) {
+          const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (/^(?:tất cả bình luận|all comments)$/i.test(text)) return text;
+        }
+        return false;
+      }, { timeout: 3500 }).catch(() => null);
+
+      if (recheckResult) {
+        const textVal = typeof recheckResult.jsonValue === 'function' ? await recheckResult.jsonValue() : 'Tất cả bình luận';
+        console.log(`[sort] final="${textVal}" switched=true verified=true`);
+        return {
+          initial: findTrigger.text,
+          final: textVal,
+          switched: true,
+          verified: true,
+        };
+      }
+
       const recheckText = await surface.evaluate((root) => {
         const clickables = [...root.querySelectorAll('button, [role="button"], div[aria-haspopup="menu"], div[tabindex]')];
         for (const el of clickables) {
@@ -550,16 +593,16 @@ async function expandPost(page, postId, config, testSortSwitch = false) {
             btn.click();
             clickedThisRound.push(text);
             clickedInPass += 1;
-            await new Promise((r) => setTimeout(r, 450));
+            await new Promise((r) => setTimeout(r, 120));
           } catch {}
         }
         if (clickedInPass === 0) break;
       }
 
       // Scroll container down
-      const scrollStep = Math.max(300, Math.round((container.clientHeight || 500) * 0.75));
+      const scrollStep = Math.max(350, Math.round((container.clientHeight || 500) * 0.8));
       container.scrollTop += scrollStep;
-      await new Promise((r) => setTimeout(r, 1200));
+      await new Promise((r) => setTimeout(r, 350));
 
       const currentWindowScrollY = window.scrollY;
       const scrollFailed = Math.abs(currentWindowScrollY - initialWindowScrollY) > 50 && container.scrollTop === prevScrollTop;
@@ -1021,8 +1064,29 @@ function toMarkdown(record) {
   return lines.join('\n');
 }
 
+async function fileExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function collect(config, options = {}) {
-  const runDir = resolveConfigPath(config, path.join(config.collection.outputDir, timestampSlug()));
+  let runDir = null;
+  if (options.outputDir) {
+    runDir = path.resolve(process.cwd(), options.outputDir);
+  } else if (options.resume && options.fromDiscovery) {
+    const stat = await fs.stat(path.resolve(process.cwd(), options.fromDiscovery)).catch(() => null);
+    if (stat?.isDirectory()) {
+      runDir = path.resolve(process.cwd(), options.fromDiscovery);
+    }
+  }
+  if (!runDir) {
+    runDir = resolveConfigPath(config, path.join(config.collection.outputDir, timestampSlug()));
+  }
+
   const rawDir = path.join(runDir, 'raw');
   const normalizedDir = path.join(runDir, 'normalized');
   await fs.mkdir(rawDir, { recursive: true });
@@ -1045,6 +1109,8 @@ async function collect(config, options = {}) {
         postUrl: options.postUrl ?? null,
         postId: options.postId ?? null,
         limit: options.limit ?? null,
+        fromDiscovery: options.fromDiscovery ?? null,
+        resume: Boolean(options.resume),
       },
       note: 'Local research evidence. Do not commit raw Facebook dumps or browser profile data.',
       ...fields,
@@ -1088,7 +1154,6 @@ async function collect(config, options = {}) {
 
       console.log(`\n[direct-post] Bypassing discovery. Opening target post: ${candidate.canonicalUrl}`);
       await page.goto(candidate.canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-      await randomPause(config, 1.4);
       const expansion = await expandPost(page, candidate.postId, config, options.testSortSwitch);
       const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars, expansion);
       const normalized = normalizeBundle(candidate, bundle, config);
@@ -1118,23 +1183,57 @@ async function collect(config, options = {}) {
       return;
     }
 
-    // Mode 1 & Mode 2: Search Discovery
-    currentStage = 'discovery';
-    await writeRunStatus({ status: 'running', stage: currentStage });
+    // Mode 1 & Mode 2: Search Discovery or Load from Discovery File
+    let candidates = null;
+    let discoveryDiagnostics = [];
+    let ranked = null;
 
-    const { candidates, discoveryDiagnostics } = await discover(page, config);
-    const ranked = candidates
-      .filter((item) => item.relevance.relevant)
-      .sort((a, b) => b.relevance.score - a.relevance.score || b.preview.length - a.preview.length);
+    if (options.fromDiscovery) {
+      let discoveryPath = path.resolve(process.cwd(), options.fromDiscovery);
+      const stat = await fs.stat(discoveryPath).catch(() => null);
+      if (stat?.isDirectory()) {
+        discoveryPath = path.join(discoveryPath, 'discovery.json');
+      }
+      console.log(`\n[from-discovery] Loading discovered candidates from: ${discoveryPath}`);
+      const discoveryData = JSON.parse(await fs.readFile(discoveryPath, 'utf8'));
+      const rawCandidates = discoveryData.candidates || [];
+      candidates = rawCandidates.map((c) => ({
+        ...c,
+        relevance: scoreRelevance(c.preview, config.relevance),
+      }));
+      discoveryDiagnostics = discoveryData.discoveryDiagnostics || [];
+      ranked = candidates
+        .filter((item) => item.relevance.relevant)
+        .sort((a, b) => b.relevance.score - a.relevance.score || b.preview.length - a.preview.length);
+      console.log(`[from-discovery] Loaded ${candidates.length} candidates, ${ranked.length} relevant.`);
+      await fs.writeFile(path.join(runDir, 'discovery.json'), JSON.stringify({
+        group: config.group,
+        queries: config.queries,
+        candidateCount: candidates.length,
+        relevantCount: ranked.length,
+        discoveryDiagnostics,
+        candidates,
+      }, null, 2));
+    } else {
+      currentStage = 'discovery';
+      await writeRunStatus({ status: 'running', stage: currentStage });
 
-    await fs.writeFile(path.join(runDir, 'discovery.json'), JSON.stringify({
-      group: config.group,
-      queries: config.queries,
-      candidateCount: candidates.length,
-      relevantCount: ranked.length,
-      discoveryDiagnostics,
-      candidates: candidates.map((item) => ({ ...item, relevance: item.relevance })),
-    }, null, 2));
+      const discResult = await discover(page, config);
+      candidates = discResult.candidates;
+      discoveryDiagnostics = discResult.discoveryDiagnostics;
+      ranked = candidates
+        .filter((item) => item.relevance.relevant)
+        .sort((a, b) => b.relevance.score - a.relevance.score || b.preview.length - a.preview.length);
+
+      await fs.writeFile(path.join(runDir, 'discovery.json'), JSON.stringify({
+        group: config.group,
+        queries: config.queries,
+        candidateCount: candidates.length,
+        relevantCount: ranked.length,
+        discoveryDiagnostics,
+        candidates: candidates.map((item) => ({ ...item, relevance: item.relevance })),
+      }, null, 2));
+    }
 
     // Mode 2: Discovery Only
     if (options.discoveryOnly) {
@@ -1166,6 +1265,33 @@ async function collect(config, options = {}) {
 
     for (let i = 0; i < selected.length; i += 1) {
       const candidate = selected[i];
+      const normPath = path.join(normalizedDir, `${candidate.postId}.json`);
+      const rawPath = path.join(rawDir, `${candidate.postId}.json`);
+
+      // Resume check: if already collected and complete
+      if (options.resume && (await fileExists(normPath)) && (await fileExists(rawPath))) {
+        try {
+          const existingNorm = JSON.parse(await fs.readFile(normPath, 'utf8'));
+          const existingRaw = JSON.parse(await fs.readFile(rawPath, 'utf8'));
+          const completeness = existingRaw?.expansion?.completeness ?? 'complete';
+          if (existingNorm?.schemaVersion && existingNorm?.comments && completeness === 'complete') {
+            console.log(`[resume ${i + 1}/${selected.length}] Skipping already completed post ${candidate.postId} (${candidate.canonicalUrl}).`);
+            collected.push(existingNorm);
+            postOutcomes.push({
+              postId: candidate.postId,
+              url: candidate.canonicalUrl,
+              author: existingNorm.post?.author ?? 'Unknown',
+              commentsCount: existingNorm.comments.length,
+              status: 'complete',
+              completionReason: existingRaw?.expansion?.completionReason ?? 'resumed',
+              truncationReason: null,
+              resumed: true,
+            });
+            continue;
+          }
+        } catch {}
+      }
+
       console.log(`\n[collect ${i + 1}/${selected.length}] ${candidate.canonicalUrl} score=${candidate.relevance.score}`);
 
       let attempt = 0;
@@ -1177,7 +1303,6 @@ async function collect(config, options = {}) {
         attempt += 1;
         try {
           await page.goto(candidate.canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-          await randomPause(config, 1.4);
           const expansion = await expandPost(page, candidate.postId, config, options.testSortSwitch);
           const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars, expansion);
           const normalized = normalizeBundle(candidate, bundle, config);
@@ -1204,12 +1329,11 @@ async function collect(config, options = {}) {
             truncationReason: expansion.truncationReason,
           };
           postSuccess = true;
-          await randomPause(config, 1.3);
         } catch (err) {
           lastError = err;
           if (attempt < 2) {
-            console.warn(`[retry 1/1] Post ${candidate.postId} encountered error: ${err?.message ?? err}. Retrying in 3s...`);
-            await new Promise((r) => setTimeout(r, 3000));
+            console.warn(`[retry 1/1] Post ${candidate.postId} encountered error: ${err?.message ?? err}. Retrying in 2s...`);
+            await new Promise((r) => setTimeout(r, 2000));
           }
         }
       }

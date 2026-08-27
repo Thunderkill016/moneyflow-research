@@ -252,4 +252,20 @@ test('parseCli throws on invalid --limit value', async () => {
   }, /Invalid --limit value/);
 });
 
+test('parseCli parses from-discovery, resume, and output-dir options accurately', async () => {
+  const { parseCli } = await import('../src/index.mjs');
+  const result = parseCli([
+    'collect',
+    '--from-discovery',
+    'output/run-123/discovery.json',
+    '--resume',
+    '--output-dir',
+    'output/custom-run',
+  ]);
+  assert.equal(result.command, 'collect');
+  assert.equal(result.fromDiscovery, 'output/run-123/discovery.json');
+  assert.equal(result.resume, true);
+  assert.equal(result.outputDir, 'output/custom-run');
+});
+
 
