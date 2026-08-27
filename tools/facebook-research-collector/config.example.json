@@ -36,6 +36,64 @@
     "scrollPixels": 1400,
     "maxCandidatesPerQuery": 500
   },
+  "corpus": {
+    "indexPath": "./corpus/index.json",
+    "cacheDir": "./corpus/posts",
+    "acceptedAcceptanceVersions": ["v0.3.0-strict"],
+    "nearDuplicateMaxHamming": 4
+  },
+  "topicFilter": {
+    "enabled": true,
+    "queryBoost": 5,
+    "inTopicThreshold": 9,
+    "adjacentThreshold": 3,
+    "minBodyChars": 80,
+    "commentClasses": ["in-topic", "adjacent", "ambiguous"],
+    "preflightSettleMs": 900,
+    "betweenPostsMs": 450,
+    "anchors": [
+      { "term": "quản lý chi tiêu", "weight": 6, "strong": true },
+      { "term": "quản lí chi tiêu", "weight": 6, "strong": true },
+      { "term": "tài chính cá nhân", "weight": 6, "strong": true },
+      { "term": "thu chi", "weight": 5, "strong": true },
+      { "term": "expense tracker", "weight": 5, "strong": true },
+      { "term": "sổ thu chi", "weight": 5, "strong": true },
+      { "term": "ghi chép chi tiêu", "weight": 5, "strong": true },
+      { "term": "quản lý tài chính", "weight": 5, "strong": true },
+      { "term": "giao dịch ngân hàng", "weight": 4, "strong": true },
+      { "term": "sao kê", "weight": 4, "strong": true },
+      { "term": "ví điện tử", "weight": 4, "strong": true },
+      { "term": "tiền mặt", "weight": 3, "strong": true },
+      { "term": "ngân sách", "weight": 4, "strong": true },
+      { "term": "budget", "weight": 3, "strong": true },
+      { "term": "thu nhập", "weight": 3 },
+      { "term": "tiết kiệm", "weight": 3 },
+      { "term": "money lover", "weight": 4, "strong": true },
+      { "term": "sepay", "weight": 4, "strong": true },
+      { "term": "tài khoản ngân hàng", "weight": 4, "strong": true },
+      { "term": "expense", "weight": 3, "strong": true },
+      { "term": "transaction", "weight": 2 },
+      { "term": "wallet", "weight": 2 },
+      { "term": "momo", "weight": 2 }
+    ],
+    "negativeAnchors": [
+      { "term": "quản lý bán hàng", "weight": 9 },
+      { "term": "pos", "weight": 5 },
+      { "term": "tồn kho", "weight": 6 },
+      { "term": "đơn hàng", "weight": 5 },
+      { "term": "cloud gaming", "weight": 9 },
+      { "term": "game", "weight": 5 },
+      { "term": "cv", "weight": 5 },
+      { "term": "tts", "weight": 5 },
+      { "term": "camera", "weight": 4 },
+      { "term": "thuốc", "weight": 4 },
+      { "term": "pháp lý", "weight": 4 },
+      { "term": "gia phả", "weight": 5 },
+      { "term": "developer", "weight": 1 },
+      { "term": "ai agent", "weight": 1 },
+      { "term": "website", "weight": 1 }
+    ]
+  },
   "relevance": {
     "threshold": 5,
     "include": [
@@ -74,8 +132,8 @@
   },
   "collection": {
     "maxPosts": 25,
-    "expandRounds": 10,
-    "maxClicksPerRound": 20,
+    "expandRounds": 40,
+    "maxClicksPerRound": 30,
     "outputDir": "./output",
     "rawHtmlMaxChars": 1500000
   }
