@@ -113,7 +113,11 @@ async function main() {
     }, '');
 
     const acceptanceVersion = normalizedRecord?.extraction?.acceptanceVersion ?? null;
-    const strictComplete = normalizedRecord?.extraction?.completeness === 'complete'
+    const expansion = normalizedRecord?.extraction?.expansion ?? {};
+    const strictComplete = expansion.completeness === 'complete'
+      && expansion.commentSort?.verified === true
+      && expansion.failedScrollAssertion === false
+      && (expansion.suspiciousUnmatched?.length ?? 0) === 0
       && (acceptedVersions.size === 0 || acceptedVersions.has(acceptanceVersion));
 
     if (strictComplete) {
