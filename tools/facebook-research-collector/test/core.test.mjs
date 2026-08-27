@@ -2,8 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   canonicalizeFacebookPostUrl,
+  cleanFacebookPostText,
   cleanFacebookText,
   fingerprintComment,
+  isCommentPermalink,
   scoreRelevance,
 } from '../src/core.mjs';
 
@@ -52,4 +54,109 @@ test('cleans concatenated author age and action chrome from live Facebook DOM te
 test('comment fingerprints are deterministic', () => {
   const input = { postKey: 'facebook:g:1', author: 'A', text: '50k ăn sáng', parentFingerprint: '' };
   assert.equal(fingerprintComment(input), fingerprintComment(input));
+});
+
+// --- Regression: comment permalink with same post ID must not be treated as canonical ---
+
+test('isCommentPermalink identifies comment permalinks containing the post ID', () => {
+  const postId = '2186835792103981';
+  const commentUrl = `https://www.facebook.com/groups/indiehackervn/posts/${postId}/?comment_id=2186914872096073&__cft__[0]=AZY`;
+  assert.equal(isCommentPermalink(commentUrl, postId), true);
+});
+
+test('isCommentPermalink returns false for canonical post permalink', () => {
+  const postId = '2186835792103981';
+  const canonicalUrl = `https://www.facebook.com/groups/indiehackervn/posts/${postId}/`;
+  assert.equal(isCommentPermalink(canonicalUrl, postId), false);
+});
+
+test('isCommentPermalink identifies reply_comment_id links', () => {
+  const postId = '2186835792103981';
+  const replyUrl = `https://www.facebook.com/groups/indiehackervn/posts/${postId}/?comment_id=123&reply_comment_id=456`;
+  assert.equal(isCommentPermalink(replyUrl, postId), true);
+});
+
+test('isCommentPermalink returns false for unrelated URLs', () => {
+  assert.equal(isCommentPermalink('https://www.facebook.com/', '12345'), false);
+  assert.equal(isCommentPermalink('', '12345'), false);
+  assert.equal(isCommentPermalink(null, '12345'), false);
+});
+
+// --- Regression: concatenated "ThíchTrả lờiChia sẻ1" ---
+
+test('strips concatenated Vietnamese UI controls from end of text', () => {
+  const raw = 'Vẫn là app thu chi mà có đầu tư.ThíchTrả lờiChia sẻ1';
+  const result = cleanFacebookText(raw, '');
+  assert.equal(result, 'Vẫn là app thu chi mà có đầu tư.');
+});
+
+test('strips concatenated English UI controls from end of text', () => {
+  const raw = 'This is a great app!LikeReplyShare2';
+  const result = cleanFacebookText(raw, '');
+  assert.equal(result, 'This is a great app!');
+});
+
+test('strips UI controls with dot separators', () => {
+  const raw = 'Good feedback.Thích · Trả lời · Chia sẻ · 1';
+  const result = cleanFacebookText(raw, '');
+  assert.equal(result, 'Good feedback.');
+});
+
+test('strips partial UI control pairs (ThíchTrả lời)', () => {
+  const raw = 'Vừa thương vừa mắc cười ThíchTrả lời';
+  const result = cleanFacebookText(raw, '');
+  assert.equal(result, 'Vừa thương vừa mắc cười');
+});
+
+test('strips multi-action UI tail with translation and edited flag', () => {
+  const raw = 'great idea ThíchTrả lờiXem bản dịchChia sẻĐã chỉnh sửa';
+  const result = cleanFacebookText(raw, '');
+  assert.equal(result, 'great idea');
+});
+
+test('preserves legitimate user text containing UI-like words in middle and end', () => {
+  // "Thích" (like) appears in the middle of legitimate text — must NOT be stripped
+  const raw1 = 'Tôi thích ứng dụng này vì nó rất tiện lợi';
+  assert.equal(cleanFacebookText(raw1, ''), 'Tôi thích ứng dụng này vì nó rất tiện lợi');
+
+  // "thích" at the end of sentence — must NOT be stripped
+  const raw2 = 'App này tôi rất thích';
+  assert.equal(cleanFacebookText(raw2, ''), 'App này tôi rất thích');
+
+  const raw3 = 'I really like';
+  assert.equal(cleanFacebookText(raw3, ''), 'I really like');
+});
+
+test('strips leading badge/follow prefixes', () => {
+  const raw = '· Theo dõiHay quá';
+  const result = cleanFacebookText(raw, '');
+  assert.equal(result, 'Hay quá');
+});
+
+// --- Regression: author + timestamp prefix stripping ---
+
+test('strips author name and timestamp prefix from comment text', () => {
+  const raw = 'Thái Duy Anh  · 9 tuầnVẫn là app thu chi mà có đầu tư.ThíchTrả lờiChia sẻ1';
+  const result = cleanFacebookText(raw, 'Thái Duy Anh');
+  assert.equal(result, 'Vẫn là app thu chi mà có đầu tư.');
+});
+
+test('strips verified account author timestamp prefix', () => {
+  const raw = 'Nguyen Xuan GiengTài khoản đã xác minh · 9 tuầnHà Bảo Khanh Love it!';
+  const result = cleanFacebookText(raw, 'Nguyen Xuan Gieng');
+  assert.equal(result, 'Hà Bảo Khanh Love it!');
+});
+
+test('strips English author timestamp prefix', () => {
+  const raw = 'John Doe · 3 weeksGreat app!LikeReplyShare';
+  const result = cleanFacebookText(raw, 'John Doe');
+  assert.equal(result, 'Great app!');
+});
+
+// --- Regression: post text cleaning ---
+
+test('cleanFacebookPostText strips dialog headers, Facebook noise, and public group share metadata', () => {
+  const raw = 'Bài viết của Hà Bảo KhanhFacebookFacebookFacebookBuild in Public VNHà Bảo Khanh · 9 tuần · Đã chia sẻ với Nhóm công khai\nChào anh chị em BIP VN, đây là app Finny.\nTất cả cảm xúc:80 80 27 bình luận 6 lượt chia sẻ Thích Bình luận Chia sẻ';
+  const result = cleanFacebookPostText(raw, 'Hà Bảo Khanh');
+  assert.equal(result, 'Chào anh chị em BIP VN, đây là app Finny.');
 });

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 import {
   canonicalizeFacebookPostUrl,
+  cleanFacebookPostText,
   cleanFacebookText,
   fingerprintComment,
   normalizeWhitespace,
@@ -211,9 +212,50 @@ async function expandPost(page, config) {
 async function extractPostBundle(page, postId, rawHtmlMaxChars) {
   return page.evaluate(({ postId, rawHtmlMaxChars }) => {
     const allArticles = [...document.querySelectorAll('[role="article"]')];
-    const hasPostLink = (node) => [...node.querySelectorAll('a[href]')].some((a) => a.href.includes(postId));
-    const rootCandidates = allArticles.filter(hasPostLink).sort((a, b) => (b.innerText?.length ?? 0) - (a.innerText?.length ?? 0));
-    const root = rootCandidates[0] ?? document.querySelector('main') ?? document.body;
+
+    // --- helpers ---
+
+    /** True when anchor points to canonical post permalink (not #, not comment_id) */
+    const isCanonicalPostAnchor = (a) => {
+      const rawHref = a.getAttribute('href') || '';
+      if (!rawHref || rawHref === '#' || rawHref.startsWith('#') || rawHref.startsWith('javascript:')) return false;
+      try {
+        const url = new URL(a.href, location.origin);
+        if (!/facebook\.com$/i.test(url.hostname)) return false;
+        if (url.searchParams.has('comment_id') || url.searchParams.has('reply_comment_id')) return false;
+        const path = url.pathname.replace(/\/+$/, '');
+        const isPostPath = path.endsWith(`/${postId}`) || path.includes(`/posts/${postId}`) || path.includes(`/permalink/${postId}`);
+        const isMultiPermalink = url.searchParams.get('multi_permalinks') === postId;
+        return isPostPath || isMultiPermalink;
+      } catch {
+        return false;
+      }
+    };
+
+    /** True when anchor is a comment/reply permalink */
+    const isCommentAnchor = (a) => {
+      const rawHref = a.getAttribute('href') || '';
+      if (!rawHref || rawHref.startsWith('#') || rawHref.startsWith('javascript:')) return false;
+      try {
+        const url = new URL(a.href, location.origin);
+        return (url.searchParams.has('comment_id') || url.searchParams.has('reply_comment_id')) && url.pathname.includes(postId);
+      } catch {
+        return false;
+      }
+    };
+
+    /** True when article has aria-label indicating it is a comment or reply */
+    const isCommentAriaLabel = (node) => {
+      const label = (node.getAttribute('aria-label') || '').toLowerCase();
+      return (
+        label.includes('bình luận') ||
+        label.includes('phản hồi') ||
+        label.includes('đáp lại') ||
+        label.includes('comment') ||
+        label.includes('reply') ||
+        label.includes('replied')
+      );
+    };
 
     const directLinks = (node) => [...node.querySelectorAll('a[href]')]
       .filter((a) => a.closest('[role="article"]') === node || node.getAttribute('role') !== 'article')
@@ -232,26 +274,124 @@ async function extractPostBundle(page, postId, rawHtmlMaxChars) {
       return userLink ?? links.find((x) => x.text && x.text.length <= 120) ?? null;
     };
 
-    const nested = root.getAttribute('role') === 'article'
-      ? [...root.querySelectorAll('[role="article"]')]
-      : allArticles.filter((article) => article !== root);
-    const indexByNode = new Map(nested.map((node, index) => [node, index]));
+    // --- score each article as a potential post root ---
 
-    const comments = nested.map((node, index) => {
+    const scored = allArticles.map((node) => {
+      const anchors = [...node.querySelectorAll('a[href]')];
+      const hasCanonicalLink = anchors.some(isCanonicalPostAnchor);
+      const hasCommentLinks = anchors.some(isCommentAnchor);
+      const isCommentByAria = isCommentAriaLabel(node);
+      const nestedArticleCount = node.querySelectorAll('[role="article"]').length;
+      const isTopLevel = !node.parentElement?.closest('[role="article"]');
+      const textLen = (node.innerText ?? '').length;
+
+      let score = 0;
+      const reasons = [];
+
+      if (isCommentByAria) {
+        score -= 200;
+        reasons.push('comment-aria-label');
+      }
+
+      if (hasCanonicalLink) {
+        score += 100;
+        reasons.push('has-canonical-post-link');
+      }
+
+      if (hasCommentLinks && !hasCanonicalLink) {
+        score -= 50;
+        reasons.push('has-only-comment-links');
+      }
+
+      if (!hasCanonicalLink && !hasCommentLinks) {
+        score -= 30;
+        reasons.push('no-post-links');
+      }
+
+      if (nestedArticleCount > 0) {
+        score += 30 * Math.min(nestedArticleCount, 5);
+        reasons.push(`contains-${nestedArticleCount}-nested-articles`);
+      }
+
+      if (isTopLevel) {
+        score += 10;
+        reasons.push('top-level');
+      }
+
+      // Tiebreaker: prefer longer content
+      score += Math.min(textLen / 1000, 20);
+
+      return {
+        node,
+        score,
+        reasons,
+        textPreview: (node.innerText ?? '').slice(0, 300),
+        hasCanonicalLink,
+        hasCommentLinks,
+        isCommentByAria,
+        nestedArticleCount,
+        isTopLevel,
+      };
+    });
+
+    // Determine root container:
+    // When Facebook renders a permalink, it opens the post in a [role="dialog"] modal overlay.
+    // In that modal, comments are [role="article"] elements and the post header/body is in the dialog.
+    const dialog = document.querySelector('[role="dialog"]');
+    const dialogHasContent = dialog && (
+      dialog.querySelectorAll('[role="article"]').length > 0 ||
+      (dialog.innerText || '').includes(postId) ||
+      (dialog.innerText || '').length > 200
+    );
+
+    let root = null;
+    let rootSelectionType = '';
+    let selectedScore = 0;
+    let selectedReasons = [];
+
+    if (dialogHasContent) {
+      root = dialog;
+      rootSelectionType = 'dialog';
+      selectedScore = 150;
+      selectedReasons = ['permalink-modal-dialog'];
+    } else {
+      const bestCandidate = scored[0] && scored[0].score > 0 && !scored[0].isCommentByAria ? scored[0] : null;
+      root = bestCandidate?.node ?? document.querySelector('[role="main"]') ?? document.querySelector('main') ?? document.body;
+      rootSelectionType = bestCandidate ? 'scored-article' : 'fallback-main';
+      selectedScore = bestCandidate?.score ?? 0;
+      selectedReasons = bestCandidate?.reasons ?? ['fallback-main'];
+    }
+
+    // --- collect comments ---
+    // If root is dialog, comments are all role="article" elements inside dialog.
+    // If root is article, comments are all role="article" elements on page except root.
+    const commentNodes = root === dialog
+      ? [...dialog.querySelectorAll('[role="article"]')]
+      : allArticles.filter((article) => article !== root);
+
+    const indexByNode = new Map(commentNodes.map((node, index) => [node, index]));
+
+    const comments = commentNodes.map((node, index) => {
       let parentArticle = node.parentElement?.closest('[role="article"]') ?? null;
       while (parentArticle && parentArticle !== root && !indexByNode.has(parentArticle)) {
         parentArticle = parentArticle.parentElement?.closest('[role="article"]') ?? null;
       }
       const parentIndex = parentArticle && parentArticle !== root ? indexByNode.get(parentArticle) ?? null : null;
+
+      // Determine nesting depth relative to root
       let depth = 0;
-      let cursor = parentArticle;
+      let cursor = node.parentElement?.closest('[role="article"]') ?? null;
       while (cursor && cursor !== root) {
         depth += 1;
         cursor = cursor.parentElement?.closest('[role="article"]') ?? null;
       }
+      if (!root.contains(node)) depth = 0;
+
       const links = directLinks(node);
       const author = pickAuthor(links);
       const commentLink = links.find((x) => /[?&](?:comment_id|reply_comment_id)=\d+/i.test(x.href)) ?? null;
+      const isNested = root.contains(node);
+
       return {
         index,
         parentIndex,
@@ -261,15 +401,36 @@ async function extractPostBundle(page, postId, rawHtmlMaxChars) {
         rawText: ownText(node),
         links,
         sourceUrl: commentLink?.href ?? null,
+        hierarchySource: isNested ? 'nested' : 'sibling',
       };
     });
 
     const rootLinks = directLinks(root);
     const rootAuthor = pickAuthor(rootLinks);
     const html = root.outerHTML ?? '';
+
+    // Diagnostic: top article candidates (bounded)
+    const articleCandidates = scored.slice(0, 15).map((c) => ({
+      score: c.score,
+      reasons: c.reasons,
+      textPreview: c.textPreview,
+      hasCanonicalLink: c.hasCanonicalLink,
+      hasCommentLinks: c.hasCommentLinks,
+      isCommentByAria: c.isCommentByAria,
+      nestedArticleCount: c.nestedArticleCount,
+      isTopLevel: c.isTopLevel,
+    }));
+
     return {
       pageUrl: location.href,
-      rootFoundByPostLink: rootCandidates.length > 0,
+      rootFoundByPostLink: rootSelectionType === 'dialog' || (scored[0]?.hasCanonicalLink ?? false),
+      rootSelection: {
+        type: rootSelectionType,
+        candidateCount: allArticles.length,
+        selectedScore,
+        selectedReasons,
+        articleCandidates,
+      },
       post: {
         author: rootAuthor?.text ?? null,
         authorUrl: rootAuthor?.href ?? null,
@@ -287,7 +448,8 @@ async function extractPostBundle(page, postId, rawHtmlMaxChars) {
 }
 
 function normalizeBundle(candidate, bundle, config) {
-  const postText = cleanFacebookText(bundle.post.rawText, bundle.post.author ?? '');
+  const postText = cleanFacebookPostText(bundle.post.rawText, bundle.post.author ?? '') ||
+    cleanFacebookPostText(candidate.preview ?? '', bundle.post.author ?? '');
   const comments = [];
   const fingerprints = new Map();
 
@@ -335,6 +497,7 @@ function normalizeBundle(candidate, bundle, config) {
     comments: uniqueBy(comments, (item) => item.fingerprint),
     extraction: {
       rootFoundByPostLink: bundle.rootFoundByPostLink,
+      rootSelection: bundle.rootSelection ?? null,
       pageUrl: bundle.pageUrl,
       completeness: 'best-effort; Facebook ranking, privacy, lazy loading, deleted content and UI changes can hide comments',
     },
@@ -376,9 +539,30 @@ async function collect(config, cliLimit) {
   await fs.mkdir(rawDir, { recursive: true });
   await fs.mkdir(normalizedDir, { recursive: true });
 
+  const runJsonPath = path.join(runDir, 'RUN.json');
+  const startedAt = new Date().toISOString();
+  let currentStage = 'init';
+
+  /** Persist current run status to RUN.json */
+  const writeRunStatus = async (fields) => {
+    await fs.writeFile(runJsonPath, JSON.stringify({
+      startedFromConfig: config._configPath,
+      startedAt,
+      group: config.group,
+      queries: config.queries,
+      note: 'Local research evidence. Do not commit raw Facebook dumps or browser profile data.',
+      ...fields,
+    }, null, 2));
+  };
+
+  await writeRunStatus({ status: 'running', stage: currentStage });
+
   const { context, page } = await openContext(config);
   const collected = [];
   try {
+    currentStage = 'discovery';
+    await writeRunStatus({ status: 'running', stage: currentStage });
+
     const candidates = await discover(page, config);
     const ranked = candidates
       .filter((item) => item.relevance.relevant)
@@ -397,6 +581,9 @@ async function collect(config, cliLimit) {
 
     console.log(`\n[select] ${candidates.length} candidates, ${ranked.length} relevant, collecting ${selected.length}`);
 
+    currentStage = 'collection';
+    await writeRunStatus({ status: 'running', stage: currentStage, selectedCount: selected.length });
+
     for (let i = 0; i < selected.length; i += 1) {
       const candidate = selected[i];
       console.log(`[collect ${i + 1}/${selected.length}] ${candidate.canonicalUrl} score=${candidate.relevance.score}`);
@@ -410,6 +597,7 @@ async function collect(config, cliLimit) {
         source: candidate,
         capturedAt: normalized.capturedAt,
         pageUrl: bundle.pageUrl,
+        rootSelection: bundle.rootSelection ?? null,
         raw: bundle.raw,
       }, null, 2));
       await fs.writeFile(path.join(normalizedDir, `${candidate.postId}.json`), JSON.stringify(normalized, null, 2));
@@ -419,16 +607,28 @@ async function collect(config, cliLimit) {
     }
 
     await fs.writeFile(path.join(runDir, 'dataset.json'), JSON.stringify(collected, null, 2));
-    await fs.writeFile(path.join(runDir, 'RUN.json'), JSON.stringify({
-      startedFromConfig: config._configPath,
+    await writeRunStatus({
+      status: 'completed',
       completedAt: new Date().toISOString(),
-      group: config.group,
-      queries: config.queries,
+      stage: 'done',
       records: collected.length,
-      note: 'Local research evidence. Do not commit raw Facebook dumps or browser profile data.',
-    }, null, 2));
+    });
 
     console.log(`\nDone. Local output: ${runDir}`);
+  } catch (err) {
+    await writeRunStatus({
+      status: 'failed',
+      failedAt: new Date().toISOString(),
+      stage: currentStage,
+      records: collected.length,
+      error: {
+        name: err?.name ?? 'Error',
+        message: err?.message ?? String(err),
+        // Only include stack in local diagnostics; RUN.json is .gitignored
+        stack: err?.stack ?? null,
+      },
+    }).catch(() => { /* best effort */ });
+    throw err;
   } finally {
     await context.close();
   }
