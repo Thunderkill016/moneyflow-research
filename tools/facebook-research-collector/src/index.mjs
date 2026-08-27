@@ -294,12 +294,107 @@ async function discover(page, config) {
   return { candidates: rankedCandidates, discoveryDiagnostics };
 }
 
+async function switchCommentSortToAllComments(page, postId) {
+  try {
+    const dialogs = page.locator('[role="dialog"], [aria-modal="true"]');
+    const dialogCount = await dialogs.count();
+    let surface = page.locator('body');
+    for (let i = 0; i < dialogCount; i += 1) {
+      const d = dialogs.nth(i);
+      const isVis = await d.isVisible().catch(() => false);
+      if (!isVis) continue;
+      const text = await d.innerText().catch(() => '');
+      if (text.includes(postId) || (await d.locator(`a[href*="${postId}"]`).count()) > 0 || (await d.locator('[role="article"]').count()) > 0) {
+        surface = d;
+        break;
+      }
+    }
+
+    const findTrigger = await surface.evaluate((root) => {
+      const clickables = [...root.querySelectorAll('button, [role="button"], div[aria-haspopup="menu"], div[tabindex]')];
+      for (const el of clickables) {
+        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (/^(?:phù hợp nhất|most relevant|bình luận hàng đầu|top comments|mới nhất|newest)$/i.test(text)) {
+          return { found: true, text, isAll: false };
+        }
+        if (/^(?:tất cả bình luận|all comments)$/i.test(text)) {
+          return { found: true, text, isAll: true };
+        }
+      }
+      return { found: false, text: null, isAll: false };
+    });
+
+    if (!findTrigger.found) {
+      return { initial: 'unknown', final: 'unknown', switched: false };
+    }
+
+    if (findTrigger.isAll) {
+      console.log(`[sort] Comment sort already in All comments mode: "${findTrigger.text}"`);
+      return { initial: findTrigger.text, final: findTrigger.text, switched: false };
+    }
+
+    console.log(`[sort] Found comment sort button: "${findTrigger.text}". Clicking to switch to "Tất cả bình luận"...`);
+
+    const triggerLocator = surface.locator('button, [role="button"], div[aria-haspopup="menu"], div[tabindex]').filter({
+      hasText: new RegExp(`^${findTrigger.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i'),
+    }).first();
+
+    await triggerLocator.scrollIntoViewIfNeeded().catch(() => {});
+    await triggerLocator.click({ timeout: 5000 });
+    await page.waitForTimeout(1000);
+
+    const menuOption = page.locator('[role="menuitem"], [role="menuitemradio"], [role="button"], div[tabindex], span').filter({
+      hasText: /tất cả bình luận|all comments/i,
+    });
+
+    const optionCount = await menuOption.count();
+    if (optionCount > 0) {
+      let clicked = false;
+      for (let i = 0; i < optionCount; i += 1) {
+        const opt = menuOption.nth(i);
+        if (await opt.isVisible().catch(() => false)) {
+          await opt.click({ timeout: 5000 });
+          clicked = true;
+          console.log(`[sort] Clicked "Tất cả bình luận" menu option.`);
+          break;
+        }
+      }
+      if (clicked) {
+        await page.waitForTimeout(2500);
+        const recheckText = await surface.evaluate((root) => {
+          const clickables = [...root.querySelectorAll('button, [role="button"], div[aria-haspopup="menu"], div[tabindex]')];
+          for (const el of clickables) {
+            const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (/^(?:tất cả bình luận|all comments|phù hợp nhất|most relevant)$/i.test(text)) {
+              return text;
+            }
+          }
+          return null;
+        });
+        return {
+          initial: findTrigger.text,
+          final: recheckText || 'Tất cả bình luận',
+          switched: true,
+        };
+      }
+    }
+
+    console.warn(`[sort] Menu opened but "Tất cả bình luận" option was not found/clickable.`);
+    return { initial: findTrigger.text, final: findTrigger.text, switched: false };
+  } catch (err) {
+    console.warn(`[sort] Failed to switch comment sort: ${err?.message ?? err}`);
+    return { initial: 'error', final: 'error', switched: false, error: err?.message };
+  }
+}
+
 async function expandPost(page, postId, config) {
   const maxRounds = config.collection.expandRounds ?? 80;
   const maxClicksPerRound = config.collection.maxClicksPerRound ?? 30;
   const tolerance = 80;
 
-  // 1. Detect post surface & switch sort mode to All comments
+  // 1. Detect post surface & actively switch sort mode to "Tất cả bình luận"
+  const commentSort = await switchCommentSortToAllComments(page, postId);
+
   const initInfo = await page.evaluate(({ postId }) => {
     const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
     const matchingDialog = dialogs.find((d) => {
@@ -313,21 +408,7 @@ async function expandPost(page, postId, config) {
     const surface = matchingDialog || document.querySelector('[role="main"]') || document.querySelector('main') || document.body;
     const surfaceType = matchingDialog ? 'dialog' : (document.querySelector('[role="main"]') || document.querySelector('main') ? 'main' : 'body');
 
-    // Switch comment sort to All comments if possible
-    const sortResult = (() => {
-      const sortButton = [...surface.querySelectorAll('button, [role="button"], div[tabindex]')].find((el) => {
-        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-        return /^(?:phù hợp nhất|most relevant|bình luận hàng đầu|top comments)$/i.test(text);
-      });
-      if (sortButton) return { initial: (sortButton.innerText || '').trim(), final: 'Phù hợp nhất', switched: false };
-      const allBtn = [...surface.querySelectorAll('button, [role="button"], div[tabindex]')].find((el) => {
-        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-        return /^(?:tất cả bình luận|all comments)$/i.test(text);
-      });
-      return { initial: allBtn ? 'Tất cả bình luận' : 'unknown', final: allBtn ? 'Tất cả bình luận' : 'unknown', switched: false };
-    })();
-
-    return { surfaceType, commentSort: sortResult };
+    return { surfaceType };
   }, { postId });
 
   let prevArticles = 0;
@@ -541,7 +622,7 @@ async function expandPost(page, postId, config) {
     surfaceType: initInfo.surfaceType,
     scrollContainerReason: roundLogs[0]?.scrollContainerReason ?? 'detected-container',
     failedScrollAssertion,
-    commentSort: initInfo.commentSort,
+    commentSort,
     totalRounds: roundLogs.length,
     completionReason,
     completeness,
