@@ -1,15 +1,16 @@
 {
   "name": "moneyflow-facebook-research-collector",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "Browser-assisted collector for bounded Facebook research evidence.",
+  "description": "Browser-assisted collector for bounded Facebook research evidence with persistent corpus reuse.",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "login": "node src/index.mjs login",
-    "collect": "node src/index.mjs collect",
+    "collect": "node src/topic-runner.mjs collect",
+    "collect:legacy": "node src/index.mjs collect",
     "test": "node --test"
   },
   "dependencies": {
