@@ -1,31 +1,51 @@
 # Facebook research collector
 
-Browser-assisted collection of Facebook research evidence for MoneyFlow. The collector is designed to minimize repeated work across research topics while preserving provenance and explicit completeness limits.
+Browser-assisted Facebook research evidence collector for MoneyFlow.
 
-It is intentionally **not** a stealth scraper. It does not bypass authentication, checkpoints, rate limits, privacy controls, anti-bot controls, or deleted/hidden content. Use it only for content the signed-in account is legitimately allowed to view and stop if Facebook blocks automated activity.
+The collector is deliberately **user-driven, local, and fail-closed**. It uses the signed-in browser profile only for content that account is legitimately allowed to view. It does not automate credentials, bypass checkpoints/CAPTCHAs/rate limits/privacy controls, spoof fingerprints, or add stealth behavior.
 
-## v0.3 pipeline
+## v0.7 architecture
 
-The default `npm run collect` path now separates discovery, cheap full-body classification, corpus reuse, and expensive comment collection:
+The default flow separates candidate discovery, verified root-post capture, human/agent semantic assessment, corpus reuse, and expensive comment collection:
 
 ```text
 Facebook discovery
-  -> candidate post identity
-  -> persistent corpus lookup
-       -> known body/complete post: reuse local evidence
-       -> unseen post: open once for full-body preflight
-  -> full-body topic classification
-       -> in-topic / adjacent / ambiguous: comment collection eligible
-       -> out-of-topic: body-only exclusion evidence
-  -> exact previously-complete post: reuse normalized post/comments
-  -> new eligible post: deep comment/reply collection
-  -> exact-content / near-content fingerprint flag
-  -> local corpus index + normalized cache update
+  -> canonical candidate identity (group + post id)
+  -> corpus lookup
+       -> accepted strict-complete record: trusted/reusable evidence
+       -> seen/legacy body cache: NOT trusted for review
+  -> strict root-post body gate
+       -> exact clean permalink for target post required inside root article
+       -> comment_id / reply_comment_id links are provenance only, never root proof
+       -> ambiguous/missing root => retry, then hard failure
+       -> verified body stamped with acceptance version + body hash
+  -> assessor reads COMPLETE verified root body
+       -> relevant=false => SKIP comments
+       -> relevant=true + accepted complete cache => REUSE
+       -> relevant=true + not complete => COLLECT comments
+  -> deep comment/reply collector
+       -> All comments when available
+       -> post-surface-scoped interaction/scrolling
+       -> bottom-stable convergence + completeness diagnostics
+  -> local corpus/cache update
 ```
 
-The corpus layer is deliberately cross-topic. If the same Facebook post appears in later searches, the collector records the new query provenance but does not re-fetch its comment tree when a compatible complete normalized record already exists.
+Search keywords are recall-oriented candidate discovery only. They are **not** the final relevance classifier. The collector contains no OpenAI key, no external semantic-classification API, and no local LLM dependency. The assessor is operational: it reads the full verified body and records a binary topic judgment.
 
-Near-duplicate **content is not automatically discarded**. Reposts/cross-posts can have different discussion threads, so SimHash/Hamming-distance matches are recorded as review metadata only. Exact Facebook source identity is the hard reuse boundary.
+## Why v0.7 changed the body gate
+
+Facebook search/permalink surfaces can expose timestamp links carrying `comment_id` or `reply_comment_id`. Those URLs contain the parent post ID even when the visible article is a comment/reply. A loose rule such as “article contains the target post id” can therefore cache comment text as if it were the root post.
+
+v0.7 treats **identity as an acceptance contract**, not a scoring hint:
+
+- a reviewable root article must contain a clean permalink for the exact target post;
+- highlighted comment/reply links alone never establish root identity;
+- a missing or ambiguous root fails closed instead of choosing the “best-looking” article;
+- legacy `status=seen` body caches are considered stale until recaptured through the strict gate;
+- a topic judgment on a seen record is reusable only when it is bound to the exact `bodyContentHash` and body-acceptance version;
+- old accepted strict-complete comment records remain reusable when their acceptance version is explicitly allowed.
+
+This prevents a bad preflight body or stale judgment from silently becoming permanent corpus truth.
 
 ## Requirements
 
@@ -33,7 +53,7 @@ Near-duplicate **content is not automatically discarded**. Reposts/cross-posts c
 - Chromium installed through Playwright
 - a Facebook account that can legitimately view the target content
 
-Current pinned Playwright version: `1.62.1`.
+Pinned Playwright: `1.62.1`.
 
 ## Setup
 
@@ -44,7 +64,7 @@ npx playwright install chromium
 cp config.example.json config.json
 ```
 
-Edit `config.json` for the current discovery surface/query set, full-body filter rules, and local corpus paths.
+`config.json`, `profile/`, `output/`, `corpus/`, raw evidence, and normalized Facebook datasets stay local and are gitignored.
 
 ## Login once
 
@@ -52,76 +72,114 @@ Edit `config.json` for the current discovery surface/query set, full-body filter
 npm run login -- --config config.json
 ```
 
-A headed browser opens. Log in yourself, then return to the terminal and press Enter. The browser profile stays under local `profile/` and is gitignored.
+A headed browser opens. Log in manually. Never add Facebook passwords, cookies, tokens, exported browser state, or collected personal data to this repository.
 
-Never put Facebook passwords, cookies, access tokens, or exported browser state in this repository.
+## Discovery modes
 
-## Seed the corpus from an existing run
+The discovery implementation supports two explicit scopes.
 
-Before researching the next topic, import prior normalized runs so already-complete posts are reusable immediately:
+### Focused group search
 
-```bash
-npm run corpus:import -- \
-  --config config.json \
-  --from-run output/2026-08-27T19-01-01-462Z
+Current example config uses:
+
+```json
+{
+  "discovery": { "scope": "group" },
+  "groups": [
+    {
+      "id": "1569314343856132",
+      "aliases": ["1569314343856132", "indiehackervn"]
+    },
+    {
+      "id": "j2team.community",
+      "aliases": ["j2team.community"]
+    }
+  ]
+}
 ```
 
-`--from-run` accepts either a run directory or its `dataset.json` file.
+Aliases are explicit because Facebook can navigate a numeric group ID while rendering post URLs with a vanity slug. The canonical evidence keeps the actual group identifier observed on the post URL rather than rewriting it to a configured fallback.
 
-The importer:
+### Global Posts search
 
-- indexes full normalized post bodies;
-- caches compatible strict-complete normalized post/comment records;
-- uses the final collected Facebook URL when available to repair old group-alias/provenance ambiguity;
-- does not make old incomplete/older-acceptance records reusable as complete evidence.
+Set:
 
-## Collect a topic
+```json
+{
+  "discovery": { "scope": "topic" }
+}
+```
+
+This uses Facebook's global Posts search surface. It can broaden coverage but also introduces substantial cross-group noise. The strict body/review gate applies identically in either discovery mode.
+
+## Prepare a semantic review queue
+
+Run discovery and body preparation together:
 
 ```bash
 npm run collect -- --config config.json --query "quản lý chi tiêu"
 ```
 
-Use a prior discovery artifact without rediscovering:
+Or reuse a prior discovery artifact:
 
 ```bash
 npm run collect -- \
   --config config.json \
-  --from-discovery output/<run>/discovery.json
+  --from-discovery output/<run>/discovery.json \
+  --output-dir output/<review-run>
 ```
 
-Important v0.3 options:
+v0.7 writes:
 
 ```text
---corpus-index <path>   Override local corpus index path
---recollect-known       Ignore complete-record reuse and collect eligible known posts again
---ignore-corpus         Run without reading/writing the persistent corpus
---skip-topic-filter     Disable the full-body gate for a diagnostic run
+review-queue.json
+relevance-decisions.template.json
+body-capture-diagnostics.json
+body-capture-failures.json      # only when capture fails
+TOPIC_RUN.json
 ```
 
-Legacy deep collector behavior remains available for debugging:
+If any candidate cannot produce a verified root body after bounded retries, `TOPIC_RUN.status` becomes `blocked-body-capture` and the command fails. Do not assess or apply a partial queue as complete evidence.
+
+Relevant review configuration:
+
+```json
+{
+  "review": {
+    "topicKey": "personal-expense-management",
+    "bodyCaptureRetries": 2,
+    "bodyCaptureRetryDelayMs": 800
+  }
+}
+```
+
+## Assess and apply
+
+The assessor reads each `review-queue.json.items[].body` in full and fills the generated decision template. A decision must preserve the generated `bodyContentHash` for that post.
+
+Then apply:
 
 ```bash
-npm run collect:legacy -- --config config.json ...
+npm run collect -- \
+  --config config.json \
+  --from-review output/<review-run>/review-queue.json \
+  --decisions output/<review-run>/relevance-decisions.json \
+  --output-dir output/<collection-run>
 ```
 
-## Full-body filter
+The v0.7 apply gate rejects:
 
-Preview text is not reliable enough to decide topic relevance. v0.3 therefore uses preview scoring only as discovery metadata and performs a conservative full-post-body gate before expanding comments.
+- old review schema;
+- decisions for another topic;
+- missing/non-boolean relevance decisions;
+- a decision whose `bodyContentHash` no longer matches the queued body;
+- a body that became stale/untrusted after queue generation.
 
-Classification states:
+Only verified relevant posts proceed to the expensive deep comment collector.
 
-- `in-topic`: strong evidence for the current topic;
-- `adjacent`: useful neighboring mechanism/market evidence;
-- `ambiguous`: insufficient evidence to safely exclude;
-- `out-of-topic`: obvious search noise; keep body/provenance locally but do not pay the cost of expanding the comment tree.
+## Corpus and reuse
 
-The default PFM rules in `config.example.json` were calibrated against the collected 69-post `quản lý chi tiêu` audit. On that fixed audit they would retain all 13 manually audited core PFM threads while excluding 37 obvious out-of-topic posts before expensive comment expansion. That is a **regression/calibration result, not a claim about Facebook search precision or Vietnamese market prevalence**.
-
-Prefer recall over aggressive exclusion. If uncertain, classify `ambiguous` and collect the discussion.
-
-## Persistent corpus and deduplication
-
-Local files are gitignored:
+Local corpus layout:
 
 ```text
 corpus/
@@ -130,43 +188,39 @@ corpus/
     <source-key-hash>.json
 ```
 
-`index.json` stores source/query provenance, body fingerprints, acceptance version, cache references, and per-topic classification metadata. Normalized cache records let a later topic reuse a previously collected post without reopening its full comment tree.
+Hard reuse boundary: exact Facebook source/post identity. Same-body/near-body fingerprints can flag probable reposts but do not collapse different post threads automatically.
 
-Deduplication rules:
+Reuse rules:
 
-1. same exact corpus/source identity -> reuse when strict-complete and acceptance-compatible;
-2. same unique Facebook post ID under an alias -> reuse the one known record;
-3. same normalized body SHA-256 but different source identity -> flag `exact-content`, do not drop;
-4. close 64-bit SimHash/Hamming match -> flag `near-content`, do not drop;
-5. different post/source identities remain separate evidence unless a human/research rule explicitly decides otherwise.
+1. accepted strict-complete record + cache file => body and comments can be reused;
+2. strict v0.7 preflight body => body can be reused for review;
+3. legacy seen body without strict validation => recapture once before review;
+4. topic judgment on a seen body => reuse only when body hash and body acceptance version still match;
+5. same unique post ID under a known alias can resolve to the existing corpus record;
+6. different post identities remain distinct evidence even when text is identical.
 
-This prevents repeated scraping across topics without collapsing distinct discussions that happen to quote/repost the same text.
+## Deep comment completeness
 
-## Output
+Comment extraction is still bounded by what normal Facebook UI exposes to the signed-in account. The accepted deep collector attempts to:
 
-The wrapper keeps the normal local evidence and adds topic-processing artifacts:
+- switch to `Tất cả bình luận / All comments` when available and verify the transition;
+- interact only inside the selected post surface;
+- expand visible comment/reply controls;
+- scroll the post's internal scroll container, not the background feed;
+- continue until bottom-stable convergence;
+- record truncation/failure instead of pretending success.
 
-```text
-output/<run>/
-  discovery.json              # discovery source artifact when produced by this run
-  discovery.filtered.json     # only candidates eligible for new deep collection
-  preflight.json              # full-body classifications/dispositions
-  exclusions.json             # local body-only out-of-topic evidence
-  collection-reconciliation.json
-  reconciliation.json         # final fetched/reused/excluded accounting
-  dataset.json                # relevant complete records, including corpus reuse
-  TOPIC_RUN.json
-  raw/
-  normalized/
+A “complete” record means complete under these collector invariants for the accessible UI surface. It is not a claim of global Facebook exhaustiveness.
+
+## Import prior strict-complete runs
+
+```bash
+npm run corpus:import -- \
+  --config config.json \
+  --from-run output/<prior-run>
 ```
 
-Raw/source dumps, normalized datasets, profile state, config, and corpus cache remain local and are not committed to the public research repository.
-
-## Completeness semantics
-
-Deep comment extraction remains best-effort because Facebook ranking, privacy, lazy loading, deleted content, UI experiments, and account-specific visibility can hide material.
-
-A strict-complete post is reusable only when its accepted collector version confirms the required comment-sort, bottom-convergence, scroll-surface, and residual-expand-control invariants. Older records can still provide body text for classification but must be re-collected before being treated as compatible complete comment evidence.
+The importer can seed accepted complete records so later topics do not re-fetch the same discussion unnecessarily.
 
 ## Tests
 
@@ -174,13 +228,33 @@ A strict-complete post is reusable only when its accepted collector version conf
 npm test
 ```
 
-Coverage includes URL/comment parsing, UI cleanup, strict CLI behavior, corpus reuse by source/post identity, local atomic registry/cache round-trips, SimHash near-duplicate flagging, and full-body topic filtering.
+v0.7 regression coverage includes the previously observed failure class: a comment-highlight-only article carrying the parent post ID must not be accepted as the root post. Tests also cover stale body-cache rejection and binding topic judgments to the body hash/version.
 
-## Failure modes
+## Debug paths
 
-- Facebook asks for login/checkpoint: complete login manually; do not automate around it.
-- Facebook blocks automated activity: stop; do not add stealth/fingerprint/CAPTCHA/rate-limit bypasses.
-- Search UI changes: discovery may return zero/noisy candidates; preserve diagnostics and inspect the UI before changing selectors.
-- Topic filter becomes too aggressive: use `--skip-topic-filter` for diagnosis and update rules against a reviewed corpus; do not silently drop ambiguous posts.
-- Corpus cache is missing/corrupt: fail visibly or re-import/recollect; never pretend an absent cache is reusable complete evidence.
-- A post has ranked/hidden comments: record the limitation; do not claim global Facebook exhaustiveness.
+The current strict path is the default:
+
+```bash
+npm run collect
+npm run collect:review
+```
+
+Older paths remain available only for diagnosis/comparison:
+
+```bash
+npm run collect:review:legacy
+npm run collect:legacy
+npm run collect:semantic
+npm run collect:heuristic
+```
+
+Do not use a legacy path as acceptance evidence for new corpus judgments.
+
+## Failure policy
+
+- Login/checkpoint appears: handle login manually; do not automate around it.
+- Facebook blocks activity: stop; do not add bypass or stealth behavior.
+- Root body cannot be proven: fail and preserve diagnostics; do not select a comment as fallback.
+- Corpus accepted cache is missing/corrupt: fail visibly; re-import/recollect rather than invent reuse.
+- UI/search shape changes: inspect diagnostics/live UI, update the smallest validated contract, and add a regression test for the observed failure.
+- Ranking/privacy/account visibility limits evidence: record the limitation; never call a finite query set “all Facebook”.
