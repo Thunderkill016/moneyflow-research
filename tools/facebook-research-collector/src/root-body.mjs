@@ -1,11 +1,17 @@
 import { cleanFacebookPostText } from './core.mjs';
 import { hashText, parseFacebookPostIdentity } from './corpus.mjs';
 
-// v4 requires a unique root article and binds all deep-comment UI work to the
-// root-derived surface. Deep collection may re-prove identity, but it must not
-// recapture the full root body after the assessor has already reviewed it.
-export const ROOT_BODY_ACCEPTANCE_VERSION = 'v0.8-strict-root-body-v4';
+// v5 keeps the clean-permalink proof as the strongest signal, but no longer
+// blocks for a self-permalink anchor that Facebook may omit. When the final URL
+// already proves the exact post/group, one unique non-comment article with an
+// explicit root Comment action may prove the root instead. Ambiguity still
+// fails closed. Historical v4 evidence remains reusable.
+export const ROOT_BODY_ACCEPTANCE_VERSION = 'v0.9-strict-root-body-v5';
 export const DEEP_COLLECTION_ACCEPTANCE_VERSION = 'v0.8-strict-deep-collection-v2';
+const SUPPORTED_ROOT_BODY_ACCEPTANCE_VERSIONS = new Set([
+  'v0.8-strict-root-body-v4',
+  ROOT_BODY_ACCEPTANCE_VERSION,
+]);
 
 function normalizeWhitespace(value = '') {
   return String(value).replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
@@ -22,6 +28,10 @@ function normalizedGroupIdentifier(value) {
 function normalizedGroupIdentifiers(value) {
   const values = value == null ? [] : (Array.isArray(value) ? value : [value]);
   return new Set(values.map(normalizedGroupIdentifier).filter(Boolean));
+}
+
+function isSupportedRootBodyAcceptanceVersion(value) {
+  return SUPPORTED_ROOT_BODY_ACCEPTANCE_VERSIONS.has(String(value ?? ''));
 }
 
 export function classifyPostHref(href, targetPostId, targetGroupIdentifiers = null) {
@@ -82,9 +92,6 @@ export function selectStrictRootArticle(snapshots, targetPostId, targetGroupIden
     };
     diagnostics.push(row);
 
-    // A clean permalink for the exact target post AND source group is the hard
-    // admission contract. Highlighted comment links contain the parent post id
-    // and are therefore not sufficient evidence that an article is the root.
     if (cleanEvidence.length === 0 || looksLikeComment) continue;
     const distinctKeys = [...new Set(cleanEvidence.map((item) => item.identity.key))];
     if (distinctKeys.length !== 1) continue;
@@ -110,8 +117,6 @@ export function selectStrictRootArticle(snapshots, targetPostId, targetGroupIden
     };
   }
 
-  // Scores are diagnostics only. A score must never choose one candidate when
-  // multiple articles independently claim to be the same root post.
   if (eligible.length !== 1) {
     return {
       ok: false,
@@ -122,19 +127,120 @@ export function selectStrictRootArticle(snapshots, targetPostId, targetGroupIden
     };
   }
 
-  const best = eligible[0];
-
   return {
     ok: true,
     reason: 'clean-target-post-permalink',
     diagnostics,
-    eligibleCount: eligible.length,
-    selection: best,
+    eligibleCount: 1,
+    selection: eligible[0],
+    evidenceMode: 'clean-target-post-permalink',
+  };
+}
+
+function rootActionSignals(snapshot = {}) {
+  const actions = (snapshot.actionTexts ?? []).map(normalizeWhitespace).filter(Boolean);
+  const hasComment = actions.some((text) => /^(?:comment|bình luận)$/i.test(text));
+  const hasShare = actions.some((text) => /^(?:share|chia sẻ)$/i.test(text));
+  const hasLike = actions.some((text) => /^(?:like|thích)$/i.test(text));
+  return { actions, hasComment, hasShare, hasLike };
+}
+
+/**
+ * Fallback admission is allowed only after the browser URL itself has proven
+ * the exact target post/group. It never chooses the longest/first article.
+ * The fallback requires exactly one visible non-comment article with a root
+ * Comment action and no target comment/reply-highlight evidence.
+ */
+export function selectUrlAnchoredRootArticle(
+  snapshots,
+  targetPostId,
+  targetGroupIdentifiers,
+  finalIdentity,
+) {
+  const strict = selectStrictRootArticle(snapshots, targetPostId, targetGroupIdentifiers);
+  if (strict.ok) return strict;
+
+  const expectedGroups = normalizedGroupIdentifiers(targetGroupIdentifiers);
+  const finalPostId = normalizedPostId(finalIdentity?.postId);
+  const finalGroup = normalizedGroupIdentifier(finalIdentity?.groupIdentifier);
+  if (
+    finalPostId !== normalizedPostId(targetPostId)
+    || !finalGroup
+    || (expectedGroups.size > 0 && !expectedGroups.has(finalGroup))
+  ) {
+    return {
+      ...strict,
+      fallbackReason: 'final-url-identity-not-proven',
+      fallbackEligibleCount: 0,
+    };
+  }
+
+  const fallback = [];
+  const fallbackDiagnostics = [];
+  for (let index = 0; index < (snapshots ?? []).length; index += 1) {
+    const snapshot = snapshots[index] ?? {};
+    const aria = normalizeWhitespace(snapshot.ariaLabel ?? '');
+    const looksLikeComment = /\b(comment|reply|bình luận|phản hồi)\b/i.test(aria);
+    const targetEvidence = (snapshot.links ?? [])
+      .map((link) => classifyPostHref(link?.href, targetPostId, targetGroupIdentifiers))
+      .filter(Boolean);
+    const highlightedEvidence = targetEvidence.filter((item) => !item.clean);
+    const actions = rootActionSignals(snapshot);
+    const eligible = !looksLikeComment && highlightedEvidence.length === 0 && actions.hasComment;
+    fallbackDiagnostics.push({
+      index,
+      looksLikeComment,
+      highlightedLinks: highlightedEvidence.length,
+      hasCommentAction: actions.hasComment,
+      hasShareAction: actions.hasShare,
+      hasLikeAction: actions.hasLike,
+      actionTexts: actions.actions.slice(0, 20),
+      eligible,
+    });
+    if (!eligible) continue;
+    fallback.push({
+      index,
+      score: 100 + (actions.hasShare ? 10 : 0) + (actions.hasLike ? 5 : 0),
+      text: normalizeWhitespace(snapshot.text ?? ''),
+      cleanHref: null,
+      identity: {
+        ...finalIdentity,
+        postId: String(finalIdentity.postId),
+        groupIdentifier: finalIdentity.groupIdentifier,
+        key: `facebook:${finalIdentity.groupIdentifier}:${finalIdentity.postId}`,
+        canonicalUrl: `https://www.facebook.com/groups/${finalIdentity.groupIdentifier}/permalink/${finalIdentity.postId}/`,
+      },
+      distinctKeys: [`facebook:${finalIdentity.groupIdentifier}:${finalIdentity.postId}`],
+      cleanLinks: 0,
+      highlightedLinks: 0,
+    });
+  }
+
+  if (fallback.length !== 1) {
+    return {
+      ok: false,
+      reason: fallback.length === 0 ? 'no-url-anchored-root-article' : 'ambiguous-url-anchored-root-articles',
+      diagnostics: strict.diagnostics,
+      fallbackDiagnostics,
+      eligibleCount: strict.eligibleCount ?? 0,
+      fallbackEligibleCount: fallback.length,
+      fallbackEligibleIndexes: fallback.map((item) => item.index),
+    };
+  }
+
+  return {
+    ok: true,
+    reason: 'final-url-plus-unique-root-actions',
+    diagnostics: strict.diagnostics,
+    fallbackDiagnostics,
+    eligibleCount: 1,
+    selection: fallback[0],
+    evidenceMode: 'final-url-plus-unique-root-actions',
   };
 }
 
 export function isStrictBodyValidation(validation, expectedPostId = null, expectedGroupIdentifier = null) {
-  if (!validation || validation.acceptanceVersion !== ROOT_BODY_ACCEPTANCE_VERSION) return false;
+  if (!validation || !isSupportedRootBodyAcceptanceVersion(validation.acceptanceVersion)) return false;
   if (validation.rootIdentityVerified !== true) return false;
   const targetPostId = normalizedPostId(validation.targetPostId);
   const rootPostId = normalizedPostId(validation.rootPostId);
@@ -151,19 +257,15 @@ export function isStrictBodyValidation(validation, expectedPostId = null, expect
   if (expectedGroup && targetGroup !== expectedGroup) return false;
   if (rootGroup !== targetGroup) return false;
   if (allowedGroups.size === 0) {
-    return finalGroup === targetGroup;
+    if (finalGroup !== targetGroup) return false;
+  } else if (!allowedGroups.has(targetGroup) || !allowedGroups.has(finalGroup)) {
+    return false;
   }
-  if (!allowedGroups.has(targetGroup) || !allowedGroups.has(finalGroup)) return false;
-  return true;
-}
 
-function cleanTargetLinkSelector(postId) {
-  const id = String(postId).replace(/[^0-9]/g, '');
-  if (!id) throw new Error(`Invalid Facebook post id: ${postId}`);
-  return [
-    `a[href*="/posts/${id}"]:not([href*="comment_id="]):not([href*="reply_comment_id="])`,
-    `a[href*="/permalink/${id}"]:not([href*="comment_id="]):not([href*="reply_comment_id="])`,
-  ].join(', ');
+  if (validation.acceptanceVersion === ROOT_BODY_ACCEPTANCE_VERSION) {
+    if (!['clean-target-post-permalink', 'final-url-plus-unique-root-actions'].includes(validation.rootIdentityEvidence)) return false;
+  }
+  return true;
 }
 
 async function snapshotVisibleArticles(page, { includeText = true } = {}) {
@@ -171,44 +273,96 @@ async function snapshotVisibleArticles(page, { includeText = true } = {}) {
     text: options.includeText ? (article.innerText || article.textContent || '').replace(/\s+/g, ' ').trim() : '',
     ariaLabel: article.getAttribute('aria-label') || '',
     links: [...article.querySelectorAll('a[href]')].map((a) => ({ href: a.href })),
+    actionTexts: [...article.querySelectorAll('button, [role="button"]')].map((el) => {
+      const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+      const aria = (el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+      return text || aria;
+    }).filter(Boolean),
   })), { includeText });
 }
 
-function strictRootSelectionError(message, selected) {
+function strictRootSelectionError(message, selected, code = 'STRICT_ROOT_SURFACE_UNAVAILABLE') {
   const error = new Error(message);
-  error.code = 'STRICT_ROOT_SURFACE_UNAVAILABLE';
+  error.code = code;
   error.selection = selected ?? null;
   return error;
 }
 
+async function waitForVerifiedRootSelection(page, {
+  targetPostId,
+  allowedGroupIdentifiers,
+  finalIdentity,
+  includeText,
+  timeoutMs = 2_500,
+  pollMs = 125,
+  errorCode = 'ROOT_BODY_SELECTION_FAILED',
+} = {}) {
+  const startedAt = Date.now();
+  const timeout = Math.max(250, Number(timeoutMs ?? 2_500));
+  const interval = Math.max(50, Number(pollMs ?? 125));
+  let last = null;
+  let attempts = 0;
+  do {
+    attempts += 1;
+    const snapshots = await snapshotVisibleArticles(page, { includeText });
+    last = selectUrlAnchoredRootArticle(snapshots, targetPostId, allowedGroupIdentifiers, finalIdentity);
+    if (last.ok) {
+      return {
+        ...last,
+        readyAttempts: attempts,
+        readyElapsedMs: Date.now() - startedAt,
+      };
+    }
+    if (Date.now() - startedAt >= timeout) break;
+    await page.waitForTimeout(interval);
+  } while (true);
+
+  throw strictRootSelectionError(
+    `Verified root did not become uniquely resolvable for ${targetPostId} within ${timeout}ms: ${last?.reason ?? 'unknown'}`,
+    last,
+    errorCode,
+  );
+}
+
+function assertFinalPageIdentity(page, targetPostId, allowedGroups, phase = 'root body') {
+  const finalPageUrl = page.url();
+  const finalIdentity = parseFacebookPostIdentity(finalPageUrl);
+  if (!finalIdentity?.postId || !finalIdentity?.groupIdentifier) {
+    const error = new Error(`Final page identity is not verifiable during ${phase} for post ${targetPostId}`);
+    error.code = phase === 'collection' ? 'COLLECTION_FINAL_IDENTITY_UNVERIFIABLE' : 'ROOT_BODY_FINAL_IDENTITY_UNVERIFIABLE';
+    throw error;
+  }
+  if (finalIdentity.postId !== targetPostId || !allowedGroups.has(normalizedGroupIdentifier(finalIdentity.groupIdentifier))) {
+    const error = new Error(`Final page identity changed from the allowed source during ${phase} for post ${targetPostId}`);
+    error.code = phase === 'collection' ? 'COLLECTION_FINAL_IDENTITY_MISMATCH' : 'ROOT_BODY_FINAL_IDENTITY_MISMATCH';
+    throw error;
+  }
+  return { finalPageUrl, finalIdentity };
+}
+
 /**
- * Re-resolve the one verified root and derive its containing UI surface.
- * This is identity-only: deep collection does not need to read the post body
- * again just to prove that it is operating on the correct post surface.
+ * Re-resolve the verified root and derive its containing collection surface.
+ * No root body text is needed for collection-time identity verification.
  */
 export async function resolveStrictRootSurface(page, validation) {
   if (!isStrictBodyValidation(validation)) {
     throw strictRootSelectionError('Cannot resolve a surface from invalid strict root validation');
   }
 
-  const targetPostId = validation.targetPostId;
-  const expectedGroupIdentifier = validation.rootGroupIdentifier;
-  const snapshots = await snapshotVisibleArticles(page, { includeText: false });
-  const selected = selectStrictRootArticle(snapshots, targetPostId, [expectedGroupIdentifier]);
-  if (!selected.ok) {
-    throw strictRootSelectionError(
-      `Cannot resolve one strict root surface for ${targetPostId}: ${selected.reason}`,
-      selected,
-    );
-  }
-
-  const identity = selected.selection.identity;
-  if (
-    identity.postId !== String(targetPostId)
-    || normalizedGroupIdentifier(identity.groupIdentifier) !== normalizedGroupIdentifier(expectedGroupIdentifier)
-  ) {
-    throw strictRootSelectionError(`Resolved root identity changed for ${targetPostId}`, selected);
-  }
+  const targetPostId = String(validation.targetPostId);
+  const allowedGroups = normalizedGroupIdentifiers([
+    validation.rootGroupIdentifier,
+    ...(validation.allowedGroupIdentifiers ?? []),
+  ]);
+  const { finalIdentity } = assertFinalPageIdentity(page, targetPostId, allowedGroups, 'collection');
+  const selected = await waitForVerifiedRootSelection(page, {
+    targetPostId,
+    allowedGroupIdentifiers: [...allowedGroups],
+    finalIdentity,
+    includeText: false,
+    timeoutMs: 2_500,
+    errorCode: 'STRICT_ROOT_SURFACE_UNAVAILABLE',
+  });
 
   const articles = page.locator('[role="article"]:visible');
   if (selected.selection.index >= await articles.count()) {
@@ -217,8 +371,6 @@ export async function resolveStrictRootSurface(page, validation) {
   const root = articles.nth(selected.selection.index);
   await root.waitFor({ state: 'visible', timeout: 5_000 });
 
-  // The nearest dialog/main ancestor is an observable relationship to the
-  // verified root. Never fall back to an unrelated dialog or document body.
   const surface = root.locator('xpath=ancestor-or-self::*[self::main or @role="dialog" or @aria-modal="true" or @role="main"][1]');
   if (await surface.count() !== 1 || !(await surface.isVisible().catch(() => false))) {
     throw strictRootSelectionError(`Verified root has no visible collection surface for ${targetPostId}`, selected);
@@ -233,8 +385,10 @@ export async function resolveStrictRootSurface(page, validation) {
     root,
     surface,
     surfaceType,
-    identity,
+    identity: selected.selection.identity,
+    identityEvidence: selected.evidenceMode,
     selectionDiagnostics: selected.diagnostics,
+    rootReadyElapsedMs: selected.readyElapsedMs,
   };
 }
 
@@ -248,15 +402,14 @@ async function expandRootSeeMore(root) {
     if (!(await control.isVisible().catch(() => false))) break;
     await control.click({ timeout: 4_000 });
     clicked += 1;
-    await root.page().waitForTimeout(200);
+    await root.page().waitForTimeout(150);
   }
   return clicked;
 }
 
 /**
  * Validate the body artifact already captured during review before it is
- * carried into deep collection. This checks local evidence integrity only;
- * it deliberately does not read the live DOM body a second time.
+ * carried into deep collection. This checks local evidence integrity only.
  */
 export function reviewedBodyForCollection(candidate) {
   const strictBody = candidate?.strictBody;
@@ -267,7 +420,7 @@ export function reviewedBodyForCollection(candidate) {
     error.code = 'REVIEWED_BODY_MISSING';
     throw error;
   }
-  if (strictBody.bodyAcceptanceVersion !== ROOT_BODY_ACCEPTANCE_VERSION) {
+  if (!isSupportedRootBodyAcceptanceVersion(strictBody.bodyAcceptanceVersion)) {
     const error = new Error(`Candidate ${candidate?.postId ?? 'unknown'} has a stale reviewed-body acceptance version`);
     error.code = 'REVIEWED_BODY_VERSION_MISMATCH';
     throw error;
@@ -293,14 +446,13 @@ export function reviewedBodyForCollection(candidate) {
 }
 
 /**
- * Capture one root body during review. During deep collection, when the
- * candidate already carries the verified reviewed body, this function switches
- * to an identity-only path: navigate, prove the same unique root/group, and
- * reuse the reviewed body without expanding or reading the root text again.
+ * Review phase captures the body once. Collection phase reopens the post only
+ * to prove identity/surface and reuses that reviewed body.
  */
 export async function captureStrictRootBody(page, candidate, {
   attempt = 1,
   allowedGroupIdentifiers = [],
+  rootReadyTimeoutMs = 2_500,
 } = {}) {
   const targetUrl = candidate?.canonicalUrl ?? candidate?.discoveredUrls?.[0];
   const targetIdentity = parseFacebookPostIdentity(targetUrl);
@@ -317,45 +469,35 @@ export async function captureStrictRootBody(page, candidate, {
   if (allowedGroups.size === 0) throw new Error(`Post ${targetPostId} has no source group identity`);
 
   const reviewedBody = reviewedBodyForCollection(candidate);
+  await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+  const { finalPageUrl, finalIdentity } = assertFinalPageIdentity(
+    page,
+    targetPostId,
+    allowedGroups,
+    reviewedBody ? 'collection' : 'root body',
+  );
+
+  const selected = await waitForVerifiedRootSelection(page, {
+    targetPostId,
+    allowedGroupIdentifiers: [...allowedGroups],
+    finalIdentity,
+    includeText: !reviewedBody,
+    timeoutMs: rootReadyTimeoutMs,
+    errorCode: reviewedBody ? 'COLLECTION_ROOT_IDENTITY_FAILED' : 'ROOT_BODY_SELECTION_FAILED',
+  });
+
+  const articles = page.locator('[role="article"]:visible');
+  if (selected.selection.index >= await articles.count()) {
+    const error = new Error(`Strict root article disappeared for post ${targetPostId}`);
+    error.code = reviewedBody ? 'COLLECTION_ROOT_DISAPPEARED' : 'ROOT_BODY_DISAPPEARED';
+    error.selection = selected;
+    throw error;
+  }
+  const root = articles.nth(selected.selection.index);
+  await root.waitFor({ state: 'visible', timeout: 5_000 });
+  const rootIdentity = selected.selection.identity;
+
   if (reviewedBody) {
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-    await page.locator(cleanTargetLinkSelector(targetPostId)).first().waitFor({ state: 'attached', timeout: 8_000 });
-    await page.waitForTimeout(200);
-
-    const expectedRootGroup = reviewedBody.validation.rootGroupIdentifier;
-    const snapshots = await snapshotVisibleArticles(page, { includeText: false });
-    const selected = selectStrictRootArticle(snapshots, targetPostId, [expectedRootGroup]);
-    if (!selected.ok) {
-      const error = new Error(`Strict collection identity selection failed for ${targetPostId}: ${selected.reason}`);
-      error.code = 'COLLECTION_ROOT_IDENTITY_FAILED';
-      error.selection = selected;
-      throw error;
-    }
-
-    const articles = page.locator('[role="article"]:visible');
-    if (selected.selection.index >= await articles.count()) {
-      const error = new Error(`Strict collection root disappeared for post ${targetPostId}`);
-      error.code = 'COLLECTION_ROOT_DISAPPEARED';
-      error.selection = selected;
-      throw error;
-    }
-    const root = articles.nth(selected.selection.index);
-    await root.waitFor({ state: 'visible', timeout: 5_000 });
-
-    const rootIdentity = selected.selection.identity;
-    const finalPageUrl = page.url();
-    const finalIdentity = parseFacebookPostIdentity(finalPageUrl);
-    if (!finalIdentity?.postId || !finalIdentity?.groupIdentifier) {
-      const error = new Error(`Final collection page identity is not verifiable for post ${targetPostId}`);
-      error.code = 'COLLECTION_FINAL_IDENTITY_UNVERIFIABLE';
-      throw error;
-    }
-    if (finalIdentity.postId !== targetPostId || !allowedGroups.has(normalizedGroupIdentifier(finalIdentity.groupIdentifier))) {
-      const error = new Error(`Final collection page identity changed from the allowed source for post ${targetPostId}`);
-      error.code = 'COLLECTION_FINAL_IDENTITY_MISMATCH';
-      throw error;
-    }
-
     const validation = {
       ...reviewedBody.validation,
       collectionBodyPolicy: 'single-review-capture',
@@ -363,10 +505,11 @@ export async function captureStrictRootBody(page, candidate, {
       fullBodyCaptures: 1,
       collectionIdentityVerifiedAt: new Date().toISOString(),
       collectionFinalPageUrl: finalPageUrl,
+      collectionRootIdentityEvidence: selected.evidenceMode,
       collectionRootCleanHref: selected.selection.cleanHref,
       collectionEligibleRootArticles: selected.eligibleCount,
+      collectionRootReadyElapsedMs: selected.readyElapsedMs,
     };
-
     return {
       body: reviewedBody.body,
       root,
@@ -380,29 +523,6 @@ export async function captureStrictRootBody(page, candidate, {
     };
   }
 
-  await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-  await page.locator(cleanTargetLinkSelector(targetPostId)).first().waitFor({ state: 'attached', timeout: 8_000 });
-  await page.waitForTimeout(400);
-
-  const snapshots = await snapshotVisibleArticles(page, { includeText: true });
-  const selected = selectStrictRootArticle(snapshots, targetPostId, [...allowedGroups]);
-  if (!selected.ok) {
-    const error = new Error(`Strict root-body selection failed for ${targetPostId}: ${selected.reason}`);
-    error.code = 'ROOT_BODY_SELECTION_FAILED';
-    error.selection = selected;
-    throw error;
-  }
-
-  const articles = page.locator('[role="article"]:visible');
-  const articleCount = await articles.count();
-  if (selected.selection.index >= articleCount) {
-    const error = new Error(`Strict root article disappeared for post ${targetPostId}`);
-    error.code = 'ROOT_BODY_DISAPPEARED';
-    error.selection = selected;
-    throw error;
-  }
-  const root = articles.nth(selected.selection.index);
-  await root.waitFor({ state: 'visible', timeout: 5_000 });
   const clickedSeeMore = await expandRootSeeMore(root);
   const body = cleanFacebookPostText(await root.innerText(), '');
   if (!body.trim()) {
@@ -411,26 +531,11 @@ export async function captureStrictRootBody(page, candidate, {
     throw error;
   }
 
-  const rootIdentity = selected.selection.identity;
-  const finalPageUrl = page.url();
-  const finalIdentity = parseFacebookPostIdentity(finalPageUrl);
-  if (!finalIdentity?.postId || !finalIdentity?.groupIdentifier) {
-    const error = new Error(`Final page identity is not verifiable for post ${targetPostId}`);
-    error.code = 'ROOT_BODY_FINAL_IDENTITY_UNVERIFIABLE';
-    throw error;
-  }
-  if (finalIdentity.postId !== targetPostId || !allowedGroups.has(normalizedGroupIdentifier(finalIdentity.groupIdentifier))) {
-    const error = new Error(`Final page identity changed from the allowed source for post ${targetPostId}`);
-    error.code = 'ROOT_BODY_FINAL_IDENTITY_MISMATCH';
-    throw error;
-  }
-
   const validation = {
     acceptanceVersion: ROOT_BODY_ACCEPTANCE_VERSION,
     rootIdentityVerified: true,
+    rootIdentityEvidence: selected.evidenceMode,
     targetPostId,
-    // Canonical source identity is always what the root article proves. The
-    // configured aliases only authorize an observed numeric/vanity transition.
     targetGroupIdentifier: rootIdentity.groupIdentifier,
     rootPostId: rootIdentity.postId,
     rootGroupIdentifier: rootIdentity.groupIdentifier,
@@ -442,6 +547,8 @@ export async function captureStrictRootBody(page, candidate, {
     clickedSeeMore,
     attempt,
     bodyChars: body.length,
+    rootReadyElapsedMs: selected.readyElapsedMs,
+    rootReadyAttempts: selected.readyAttempts,
     capturedAt: new Date().toISOString(),
   };
   if (!isStrictBodyValidation(validation, targetPostId, rootIdentity.groupIdentifier)) {
@@ -456,6 +563,7 @@ export async function captureStrictRootBody(page, candidate, {
     capturedAt: validation.capturedAt,
     validation,
     selectionDiagnostics: selected.diagnostics,
+    fullBodyCaptures: 1,
   };
 }
 
@@ -464,7 +572,7 @@ export function strictCompleteRecordTrust(normalizedRecord, expectedPostId = nul
   if (extraction?.acceptanceVersion !== DEEP_COLLECTION_ACCEPTANCE_VERSION) {
     return { trusted: false, reason: 'unsupported-deep-collection-acceptance-version' };
   }
-  if (extraction.bodyAcceptanceVersion !== ROOT_BODY_ACCEPTANCE_VERSION) {
+  if (!isSupportedRootBodyAcceptanceVersion(extraction.bodyAcceptanceVersion)) {
     return { trusted: false, reason: 'unsupported-root-body-acceptance-version' };
   }
   if (!String(normalizedRecord?.post?.text ?? '').trim()) return { trusted: false, reason: 'missing-verified-root-body' };
@@ -495,13 +603,13 @@ export function bodyTrust(record, acceptedCompleteVersions = []) {
   }
   if (
     record.body?.text
-    && record.body?.acceptanceVersion === ROOT_BODY_ACCEPTANCE_VERSION
+    && isSupportedRootBodyAcceptanceVersion(record.body?.acceptanceVersion)
     && isStrictBodyValidation(record.body?.validation, postId, groupIdentifier)
   ) {
     return {
       trusted: true,
       kind: 'strict-preflight',
-      reason: ROOT_BODY_ACCEPTANCE_VERSION,
+      reason: record.body.acceptanceVersion,
     };
   }
   if (record.body?.text) return { trusted: false, reason: 'legacy-or-unvalidated-body-cache' };
@@ -513,8 +621,6 @@ export function classificationTrust(record, classification, acceptedCompleteVers
   const bodyState = bodyTrust(record, acceptedCompleteVersions);
   if (!bodyState.trusted) return { trusted: false, reason: `body-untrusted:${bodyState.reason}` };
   if (bodyState.kind === 'complete-record') {
-    // Historical strict-complete records already passed the deep collector's root
-    // and comment acceptance gates. Preserve their prior topic judgments.
     return { trusted: true, reason: bodyState.reason };
   }
   if (!classification.bodyContentHash || classification.bodyContentHash !== record.body?.contentHash) {
@@ -531,7 +637,7 @@ export function stampStrictBody(record, validation) {
   if (!isStrictBodyValidation(validation, record?.source?.postId, record?.source?.groupIdentifier)) {
     throw new Error('Invalid strict body validation stamp');
   }
-  record.body.acceptanceVersion = ROOT_BODY_ACCEPTANCE_VERSION;
+  record.body.acceptanceVersion = validation.acceptanceVersion ?? ROOT_BODY_ACCEPTANCE_VERSION;
   record.body.validation = structuredClone(validation);
   return record;
 }
