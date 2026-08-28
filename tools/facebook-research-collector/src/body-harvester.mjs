@@ -157,11 +157,12 @@ export async function harvestBodiesFromDiscovery({
 } = {}) {
   if (!discoveryPath) throw new Error('discoveryPath is required');
   const config = await loadConfig(configPath);
-  const discovery = JSON.parse(await fs.readFile(path.resolve(process.cwd(), discoveryPath), 'utf8'));
+  const sourceDiscoveryPath = path.resolve(process.cwd(), discoveryPath);
+  const discovery = JSON.parse(await fs.readFile(sourceDiscoveryPath, 'utf8'));
   const candidates = selectHarvestCandidates(discovery, limit);
   const runDir = outputDir
     ? path.resolve(process.cwd(), outputDir)
-    : path.dirname(path.resolve(process.cwd(), discoveryPath));
+    : path.dirname(sourceDiscoveryPath);
   await fs.mkdir(runDir, { recursive: true });
   const indexPath = corpusIndex
     ? path.resolve(process.cwd(), corpusIndex)
@@ -180,6 +181,7 @@ export async function harvestBodiesFromDiscovery({
   await saveCorpusRegistry(indexPath, registry);
 
   const statePath = path.join(runDir, 'BODY_HARVEST_RUN.json');
+  const resolvedDiscoveryPath = path.join(runDir, 'discovery.harvested.json');
   const failures = [];
   let captured = 0;
   let browser = null;
@@ -200,12 +202,25 @@ export async function harvestBodiesFromDiscovery({
       remaining: Math.max(0, pending.length - captured - failures.length),
       current,
       failureRows: failures,
+      resolvedDiscoveryPath,
+    });
+  };
+
+  const writeResolvedDiscovery = async () => {
+    await atomicWriteJson(resolvedDiscoveryPath, {
+      ...discovery,
+      schemaVersion: discovery.schemaVersion ?? 2,
+      generatedAt: new Date().toISOString(),
+      sourceDiscoveryPath,
+      candidateCount: candidates.length,
+      candidates,
     });
   };
 
   await checkpoint(pending.length ? 'harvesting' : 'completed');
   if (!pending.length) {
-    return { status: 'completed', candidates, cacheHits, captured, failures, runDir, indexPath };
+    await writeResolvedDiscovery();
+    return { status: 'completed', candidates, cacheHits, captured, failures, runDir, indexPath, resolvedDiscoveryPath };
   }
 
   try {
@@ -233,6 +248,7 @@ export async function harvestBodiesFromDiscovery({
         await saveCorpusRegistry(indexPath, registry);
         captured += 1;
         if (captured % checkpointEvery === 0 || index === pending.length - 1) {
+          await writeResolvedDiscovery();
           await checkpoint('harvesting', { postId: candidate.postId, outcome: 'captured' });
         }
       } catch (error) {
@@ -243,6 +259,7 @@ export async function harvestBodiesFromDiscovery({
           message: error?.message ?? String(error),
           attempts: error?.attemptErrors ?? [],
         });
+        await writeResolvedDiscovery();
         await checkpoint('harvesting-with-errors', { postId: candidate.postId, outcome: 'failed' });
       }
     }
@@ -251,8 +268,9 @@ export async function harvestBodiesFromDiscovery({
   }
 
   const status = failures.length ? 'completed-with-errors' : 'completed';
+  await writeResolvedDiscovery();
   await checkpoint(status);
-  return { status, candidates, cacheHits, captured, failures, runDir, indexPath };
+  return { status, candidates, cacheHits, captured, failures, runDir, indexPath, resolvedDiscoveryPath };
 }
 
 async function main() {
@@ -267,6 +285,7 @@ async function main() {
     limit: cli.limit,
   });
   console.log(`[body-harvest] ${result.status} scope=${result.candidates.length} cacheHits=${result.cacheHits} captured=${result.captured} failures=${result.failures.length}`);
+  console.log(`[body-harvest] resolved-discovery=${result.resolvedDiscoveryPath}`);
   if (result.failures.length) process.exitCode = 1;
 }
 
