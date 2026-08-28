@@ -14,6 +14,7 @@ import {
   loadCorpusRegistry,
   parseFacebookPostIdentity,
   recordBodyPreflight,
+  rekeyCorpusRecord,
   saveCorpusRegistry,
   simHash64,
   upsertDiscovery,
@@ -43,6 +44,49 @@ test('corpus lookup refuses to merge the same post id from another group identit
   upsertDiscovery(registry, { key: 'facebook:group-a:123', postId: '123' });
   const found = findCorpusRecord(registry, { key: 'facebook:group-b:123', postId: '123' });
   assert.equal(found, null);
+});
+
+test('strict alias resolution rekeys a preflight record before the child collector uses it', () => {
+  const registry = { schemaVersion: 1, posts: {} };
+  const legacyAliasKey = 'facebook:vanity-group:123';
+  const resolvedKey = 'facebook:123456789:123';
+  const record = upsertDiscovery(registry, {
+    key: legacyAliasKey,
+    corpusKey: legacyAliasKey,
+    postId: '123',
+    groupIdentifier: 'vanity-group',
+  });
+
+  const moved = rekeyCorpusRecord(registry, record, resolvedKey);
+  assert.equal(moved.sourceKey, resolvedKey);
+  assert.equal(moved.source.key, resolvedKey);
+  assert.equal(registry.posts[legacyAliasKey], undefined);
+  assert.equal(registry.posts[resolvedKey], moved);
+});
+
+test('strict alias resolution refuses to merge into an existing source key', () => {
+  const registry = { schemaVersion: 1, posts: {} };
+  const old = upsertDiscovery(registry, { key: 'facebook:vanity-group:123', postId: '123' });
+  upsertDiscovery(registry, { key: 'facebook:123456789:123', postId: '123' });
+  assert.throws(
+    () => rekeyCorpusRecord(registry, old, 'facebook:123456789:123'),
+    /target source key facebook:123456789:123 already exists/,
+  );
+});
+
+test('strict alias resolution detaches an obsolete untrusted cache before rekeying', () => {
+  const registry = { schemaVersion: 1, posts: {} };
+  const record = upsertDiscovery(registry, { key: 'facebook:vanity-group:123', postId: '123' });
+  record.status = 'complete';
+  record.acceptanceVersion = 'v0.8-strict-deep-collection-v1';
+  record.cacheFile = 'posts/legacy.json';
+
+  const moved = rekeyCorpusRecord(registry, record, 'facebook:123456789:123', { resetUntrustedCache: true });
+  assert.equal(moved.status, 'seen');
+  assert.equal(moved.acceptanceVersion, null);
+  assert.equal(moved.cacheFile, null);
+  assert.equal(registry.posts['facebook:vanity-group:123'], undefined);
+  assert.equal(registry.posts['facebook:123456789:123'], moved);
 });
 
 test('near duplicate is flagged but remains a separate source key', () => {

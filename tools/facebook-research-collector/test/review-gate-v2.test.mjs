@@ -3,15 +3,18 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { hashText } from '../src/corpus.mjs';
 import { assertReviewedBodyIsCurrent } from '../src/index.mjs';
+import { assertReviewRowStillCurrent } from '../src/review-topic-runner-v2.mjs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { chromium } from 'playwright';
 import {
   DEEP_COLLECTION_ACCEPTANCE_VERSION,
   ROOT_BODY_ACCEPTANCE_VERSION,
   bodyTrust,
   classificationTrust,
+  resolveStrictRootSurface,
   selectStrictRootArticle,
   stampStrictBody,
   strictCompleteRecordTrust,
@@ -100,6 +103,41 @@ test('strict root selection fails closed when two equally strong roots are ambig
   ], POST_ID, GROUP);
   assert.equal(selected.ok, false);
   assert.equal(selected.reason, 'ambiguous-root-post-articles');
+});
+
+test('strict root selection fails closed when clean roots have different scores', () => {
+  const selected = selectStrictRootArticle([
+    { text: 'Short clean root', ariaLabel: '', links: [{ href: ROOT }] },
+    { text: 'A second clean root with more surrounding content'.repeat(20), ariaLabel: '', links: [{ href: ROOT }] },
+  ], POST_ID, GROUP);
+  assert.equal(selected.ok, false);
+  assert.equal(selected.reason, 'ambiguous-root-post-articles');
+  assert.deepEqual(selected.eligibleIndexes, [0, 1]);
+});
+
+test('strict deep scope stays on the verified root surface when another dialog shares the post id', async (t) => {
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+  } catch (error) {
+    t.skip(`Chromium unavailable for offline surface fixture: ${error.message}`);
+    return;
+  }
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main id="verified-main" role="main">
+      <article role="article"><a href="${ROOT}">Verified root</a><p>Root post body</p></article>
+      <article role="article"><p>Verified post comment</p></article>
+    </main>
+    <div id="wrong-dialog" role="dialog">
+      <article role="article"><a href="${COMMENT}">Highlighted comment for ${POST_ID}</a></article>
+      <button>View more comments</button>
+    </div>
+  `);
+  const scope = await resolveStrictRootSurface(page, strictValidation());
+  assert.equal(await scope.surface.getAttribute('id'), 'verified-main');
+  assert.equal(scope.surfaceType, 'main');
 });
 
 test('legacy seen body cache is untrusted', () => {
@@ -191,6 +229,41 @@ test('deep collection fails instead of persisting a body changed after review', 
   assert.throws(
     () => assertReviewedBodyIsCurrent(candidate, { body: 'A changed root body' }),
     /Verified root body changed after review/,
+  );
+});
+
+test('apply-time reuse rejects a strict cache whose reviewed body changed', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'moneyflow-reuse-toctou-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const reviewedBody = 'Reviewed strict root body';
+  const cachedBody = 'Cache changed after the assessor reviewed it';
+  const cacheFile = 'cached.json';
+  const indexPath = path.join(dir, 'index.json');
+  const cachePath = path.join(dir, cacheFile);
+  const complete = record({
+    status: 'complete',
+    acceptanceVersion: DEEP_COLLECTION_ACCEPTANCE_VERSION,
+    cacheFile,
+    body: { text: reviewedBody, contentHash: hashText(reviewedBody) },
+  });
+  await fs.writeFile(cachePath, JSON.stringify({
+    source: { postId: POST_ID, groupIdentifier: GROUP },
+    post: { text: cachedBody },
+    extraction: {
+      acceptanceVersion: DEEP_COLLECTION_ACCEPTANCE_VERSION,
+      bodyAcceptanceVersion: ROOT_BODY_ACCEPTANCE_VERSION,
+      rootValidation: strictValidation(),
+    },
+  }));
+
+  await assert.rejects(
+    assertReviewRowStillCurrent(indexPath, complete, {
+      postId: POST_ID,
+      sourceGroupIdentifier: GROUP,
+      body: reviewedBody,
+      bodyContentHash: hashText(reviewedBody),
+    }, [DEEP_COLLECTION_ACCEPTANCE_VERSION]),
+    /Complete record body changed after review preparation/,
   );
 });
 

@@ -252,6 +252,13 @@ test('parseCli throws on invalid --limit value', async () => {
   }, /Invalid --limit value/);
 });
 
+test('configured collection.maxPosts bounds the default deep collection while explicit limit overrides it', async () => {
+  const { resolveCollectionPostLimit } = await import('../src/index.mjs');
+  assert.equal(resolveCollectionPostLimit(null, 25, 80), 25);
+  assert.equal(resolveCollectionPostLimit(3, 25, 80), 3);
+  assert.equal(resolveCollectionPostLimit(null, 0, 80), 80);
+});
+
 test('parseCli parses from-discovery, resume, and output-dir options accurately', async () => {
   const { parseCli } = await import('../src/index.mjs');
   const result = parseCli([
@@ -267,5 +274,4 @@ test('parseCli parses from-discovery, resume, and output-dir options accurately'
   assert.equal(result.resume, true);
   assert.equal(result.outputDir, 'output/custom-run');
 });
-
 

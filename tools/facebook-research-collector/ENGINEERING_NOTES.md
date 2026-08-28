@@ -12,7 +12,11 @@ The v0.7 review queue proved a body before assessment, but the default apply pat
 
 - one strict root capture contract now serves review and deep collection;
 - deep collection re-proves the root immediately before expanding comments and requires the recaptured body hash to equal the reviewed body hash;
-- `v0.8-strict-deep-collection-v1` is the only default reusable complete-record version; legacy artifacts remain local diagnostics, not reusable evidence;
+- `v0.8-strict-deep-collection-v2` is the only default reusable complete-record version; v1 and legacy artifacts remain local diagnostics, not reusable evidence;
+- a unique clean root is required; score is diagnostic-only and never resolves multiple eligible root articles;
+- comment sort, expansion, convergence, and extraction are all bound to the dialog/main surface derived from that unique root; no post-ID/dialog fallback is allowed in the strict path;
+- apply-time REUSE revalidates the cached strict record and its body hash, closing the review-to-reuse TOCTOU window;
+- a numeric/vanity alias proved by strict capture atomically rekeys its noncomplete registry record before the deep child process runs; an existing target key is a hard provenance conflict;
 - an explicit configured numeric/vanity alias may authorize root validation, but the final observed `group + post` key remains the reuse boundary;
 - a partial deep collection is retained as `collection-dataset.json` for diagnosis, excluded from final `dataset.json`/corpus, and recorded as `completed-with-incomplete-collection`;
 - JSON artifacts use temp write, `FileHandle.sync()`, then rename. An interrupted write cannot become a referenced partial JSON artifact.
@@ -31,6 +35,8 @@ The v0.7 review queue proved a body before assessment, but the default apply pat
 - a foreign group with the same post ID cannot resolve to a corpus record;
 - a changed body after review throws before persistence;
 - a reusable deep record must carry valid root-validation metadata.
+- a cache that changes after review preparation is rejected at REUSE rather than trusting its registry entry;
+- a strict alias transition cannot leave the corpus registry key and child collector key divergent.
 
 ## 2026-08-28 — v0.7 strict root-body review gate
 

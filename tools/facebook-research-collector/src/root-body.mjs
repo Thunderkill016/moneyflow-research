@@ -1,8 +1,11 @@
 import { cleanFacebookPostText } from './core.mjs';
 import { parseFacebookPostIdentity } from './corpus.mjs';
 
-export const ROOT_BODY_ACCEPTANCE_VERSION = 'v0.8-strict-root-body-v3';
-export const DEEP_COLLECTION_ACCEPTANCE_VERSION = 'v0.8-strict-deep-collection-v1';
+// v4 requires a unique root article and binds all deep-comment UI work to the
+// root-derived surface. v3 records cannot prove that their comment expansion
+// used the verified root's surface, so they are intentionally not reusable.
+export const ROOT_BODY_ACCEPTANCE_VERSION = 'v0.8-strict-root-body-v4';
+export const DEEP_COLLECTION_ACCEPTANCE_VERSION = 'v0.8-strict-deep-collection-v2';
 
 function normalizeWhitespace(value = '') {
   return String(value).replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
@@ -98,7 +101,6 @@ export function selectStrictRootArticle(snapshots, targetPostId, targetGroupIden
     });
   }
 
-  eligible.sort((a, b) => b.score - a.score || a.index - b.index);
   if (eligible.length === 0) {
     return {
       ok: false,
@@ -108,17 +110,19 @@ export function selectStrictRootArticle(snapshots, targetPostId, targetGroupIden
     };
   }
 
-  const best = eligible[0];
-  const tied = eligible.filter((item) => item.score === best.score);
-  if (tied.length > 1) {
+  // Scores are diagnostics only. A score must never choose one candidate when
+  // multiple articles independently claim to be the same root post.
+  if (eligible.length !== 1) {
     return {
       ok: false,
       reason: 'ambiguous-root-post-articles',
       diagnostics,
       eligibleCount: eligible.length,
-      tiedIndexes: tied.map((item) => item.index),
+      eligibleIndexes: eligible.map((item) => item.index),
     };
   }
+
+  const best = eligible[0];
 
   return {
     ok: true,
@@ -168,6 +172,70 @@ async function snapshotVisibleArticles(page) {
     ariaLabel: article.getAttribute('aria-label') || '',
     links: [...article.querySelectorAll('a[href]')].map((a) => ({ href: a.href })),
   })));
+}
+
+function strictRootSelectionError(message, selected) {
+  const error = new Error(message);
+  error.code = 'STRICT_ROOT_SURFACE_UNAVAILABLE';
+  error.selection = selected ?? null;
+  return error;
+}
+
+/**
+ * Re-resolve the one verified root and derive its containing UI surface.
+ * Deep collection must use this result instead of heuristically selecting a
+ * dialog from the page by text or a shared post id.
+ */
+export async function resolveStrictRootSurface(page, validation) {
+  if (!isStrictBodyValidation(validation)) {
+    throw strictRootSelectionError('Cannot resolve a surface from invalid strict root validation');
+  }
+
+  const targetPostId = validation.targetPostId;
+  const expectedGroupIdentifier = validation.rootGroupIdentifier;
+  const snapshots = await snapshotVisibleArticles(page);
+  const selected = selectStrictRootArticle(snapshots, targetPostId, [expectedGroupIdentifier]);
+  if (!selected.ok) {
+    throw strictRootSelectionError(
+      `Cannot resolve one strict root surface for ${targetPostId}: ${selected.reason}`,
+      selected,
+    );
+  }
+
+  const identity = selected.selection.identity;
+  if (
+    identity.postId !== String(targetPostId)
+    || normalizedGroupIdentifier(identity.groupIdentifier) !== normalizedGroupIdentifier(expectedGroupIdentifier)
+  ) {
+    throw strictRootSelectionError(`Resolved root identity changed for ${targetPostId}`, selected);
+  }
+
+  const articles = page.locator('[role="article"]:visible');
+  if (selected.selection.index >= await articles.count()) {
+    throw strictRootSelectionError(`Resolved strict root disappeared for ${targetPostId}`, selected);
+  }
+  const root = articles.nth(selected.selection.index);
+  await root.waitFor({ state: 'visible', timeout: 5_000 });
+
+  // The nearest dialog/main ancestor is an observable relationship to the
+  // verified root. Never fall back to an unrelated dialog or document body.
+  const surface = root.locator('xpath=ancestor-or-self::*[self::main or @role="dialog" or @aria-modal="true" or @role="main"][1]');
+  if (await surface.count() !== 1 || !(await surface.isVisible().catch(() => false))) {
+    throw strictRootSelectionError(`Verified root has no visible collection surface for ${targetPostId}`, selected);
+  }
+  const surfaceType = await surface.evaluate((node) => {
+    if (node.getAttribute('role') === 'dialog' || node.getAttribute('aria-modal') === 'true') return 'dialog';
+    if (node.getAttribute('role') === 'main' || node.tagName.toLowerCase() === 'main') return 'main';
+    return 'unknown';
+  });
+
+  return {
+    root,
+    surface,
+    surfaceType,
+    identity,
+    selectionDiagnostics: selected.diagnostics,
+  };
 }
 
 async function expandRootSeeMore(root) {

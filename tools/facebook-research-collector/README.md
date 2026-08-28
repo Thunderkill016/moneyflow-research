@@ -46,7 +46,8 @@ v0.8 treats **identity as an acceptance contract**, not a scoring hint:
 - legacy `status=seen` body caches are considered stale until recaptured through the strict gate;
 - a topic judgment on a seen record is reusable only when it is bound to the exact `bodyContentHash` and body-acceptance version;
 - a deep collection must prove the root again and match the body hash that the assessor reviewed;
-- only `v0.8-strict-deep-collection-v1` records are reusable by the default path; prior `v0.3` records are retained locally but are recaptured rather than silently promoted.
+- every comment sort, expansion, convergence check, and final extraction is scoped to the dialog/main ancestor of that verified root; it never chooses a dialog merely because it contains the post ID;
+- only `v0.8-strict-deep-collection-v2` records are reusable by the default path; prior v0.8/v0.3 artifacts are retained locally but are recaptured rather than silently promoted.
 
 This prevents a bad preflight body or stale judgment from silently becoming permanent corpus truth.
 
@@ -195,7 +196,7 @@ Hard reuse boundary: exact Facebook source/post identity. Same-body/near-body fi
 
 Reuse rules:
 
-1. accepted `v0.8-strict-deep-collection-v1` record + cache file => body and comments can be reused;
+1. accepted `v0.8-strict-deep-collection-v2` record + cache file => body and comments can be reused;
 2. strict v0.8 preflight body => body can be reused for review;
 3. legacy seen body without strict validation => recapture once before review;
 4. topic judgment on a seen body => reuse only when body hash and body acceptance version still match;

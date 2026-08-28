@@ -14,6 +14,7 @@ import {
   loadCachedRecord,
   loadCorpusRegistry,
   recordBodyPreflight,
+  rekeyCorpusRecord,
   reuseRecordForCandidate,
   saveCorpusRegistry,
   upsertDiscovery,
@@ -83,7 +84,7 @@ async function loadConfig(configArg) {
     corpus: {
       indexPath: './corpus/index.json',
       cacheDir: './corpus/posts',
-      acceptedAcceptanceVersions: ['v0.8-strict-deep-collection-v1'],
+      acceptedAcceptanceVersions: ['v0.8-strict-deep-collection-v2'],
       ...parsed.corpus,
     },
     review: {
@@ -326,11 +327,16 @@ async function prepareReview({ discovery, cli, config, registry, indexPath, runD
         bodySource = 'browser-strict-root';
         bodyValidation = capture.validation;
         if (capture.identity) {
+          // The strict capture, not the discovery URL alias, establishes the
+          // durable source key. Keep registry ownership and child-process
+          // candidate identity aligned before any body is persisted.
+          candidate.key = capture.identity.key;
           candidate.corpusKey = capture.identity.key;
           candidate.groupId = capture.identity.groupIdentifier ?? candidate.groupId;
           candidate.groupIdentifier = capture.identity.groupIdentifier ?? candidate.groupIdentifier;
           candidate.canonicalUrl = capture.identity.canonicalUrl ?? candidate.canonicalUrl;
           candidate.finalPageUrl = capture.finalPageUrl;
+          record = rekeyCorpusRecord(registry, record, capture.identity.key, { resetUntrustedCache: true });
         }
         record = recordBodyPreflight(registry, candidate, {
           body,
@@ -438,16 +444,29 @@ function validateReviewAndDecisions(review, decisions) {
   return map;
 }
 
-function assertReviewRowStillCurrent(record, row, acceptedVersions) {
+export async function assertReviewRowStillCurrent(indexPath, record, row, acceptedVersions) {
   const trust = bodyTrust(record, acceptedVersions);
   if (!trust.trusted) throw new Error(`Review row ${row.postId} is stale because current body is untrusted: ${trust.reason}`);
-  const currentHash = record?.body?.contentHash ?? hashText(row.body);
   if (trust.kind === 'complete-record') {
-    if (currentHash && currentHash !== row.bodyContentHash) throw new Error(`Complete record body changed after review preparation for post ${row.postId}`);
-    return;
+    const cached = await loadCachedRecord(indexPath, record);
+    if (!cached) throw new Error(`Reusable record cache missing for ${record.sourceKey}`);
+    const completeTrust = strictCompleteRecordTrust(cached, row.postId, row.sourceGroupIdentifier);
+    if (!completeTrust.trusted) {
+      throw new Error(`Reusable record cache is no longer strict evidence for ${record.sourceKey}: ${completeTrust.reason}`);
+    }
+    const cachedHash = hashText(cached?.post?.text ?? '');
+    if (cachedHash !== row.bodyContentHash) {
+      throw new Error(`Complete record body changed after review preparation for post ${row.postId}`);
+    }
+    if (record?.body?.contentHash && record.body.contentHash !== cachedHash) {
+      throw new Error(`Corpus index body hash disagrees with its cache for post ${row.postId}`);
+    }
+    return { cachedCompleteRecord: cached };
   }
+  const currentHash = record?.body?.contentHash ?? hashText(row.body);
   if (currentHash !== row.bodyContentHash) throw new Error(`Body changed after review preparation for post ${row.postId}`);
   if (record.body?.acceptanceVersion !== ROOT_BODY_ACCEPTANCE_VERSION) throw new Error(`Body acceptance changed after review preparation for post ${row.postId}`);
+  return { cachedCompleteRecord: null };
 }
 
 async function applyReview({ review, decisions, cli, config, registry, indexPath, cacheDir, runDir }) {
@@ -478,7 +497,7 @@ async function applyReview({ review, decisions, cli, config, registry, indexPath
         },
       };
     const record = findCorpusRecord(registry, candidate) ?? upsertDiscovery(registry, candidate, row.queries);
-    assertReviewRowStillCurrent(record, row, config.corpus.acceptedAcceptanceVersions);
+    const currentBody = await assertReviewRowStillCurrent(indexPath, record, row, config.corpus.acceptedAcceptanceVersions);
     const judgment = {
       relevant: Boolean(row.decision.relevant),
       reason: String(row.decision.reason ?? '').trim() || 'assessor-judgment',
@@ -501,8 +520,8 @@ async function applyReview({ review, decisions, cli, config, registry, indexPath
       disposition = 'SKIP';
       rejected.push({ candidate, judgment });
     } else if (!cli.recollectKnown && isReusableRecord(record, config.corpus.acceptedAcceptanceVersions)) {
-      const cached = await loadCachedRecord(indexPath, record);
-      if (!cached) throw new Error(`Reusable record cache missing for ${record.sourceKey}`);
+      const cached = currentBody.cachedCompleteRecord;
+      if (!cached) throw new Error(`Reusable record cache was not validated for ${record.sourceKey}`);
       disposition = 'REUSE';
       reusable.push({ candidate, normalizedRecord: reuseRecordForCandidate(cached, candidate, cli.query) });
     } else {

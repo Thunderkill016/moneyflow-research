@@ -151,7 +151,7 @@
     "indexPath": "./corpus/index.json",
     "cacheDir": "./corpus/posts",
     "acceptedAcceptanceVersions": [
-      "v0.8-strict-deep-collection-v1"
+      "v0.8-strict-deep-collection-v2"
     ],
     "nearDuplicateMaxHamming": 4
   },

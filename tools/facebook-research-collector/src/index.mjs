@@ -22,6 +22,7 @@ import {
   DEEP_COLLECTION_ACCEPTANCE_VERSION,
   ROOT_BODY_ACCEPTANCE_VERSION,
   captureStrictRootBody,
+  resolveStrictRootSurface,
 } from './root-body.mjs';
 
 export function parseCli(rawArgs = process.argv.slice(2)) {
@@ -65,6 +66,13 @@ export function parseCli(rawArgs = process.argv.slice(2)) {
     resume: Boolean(values.resume),
     outputDir: values['output-dir'] ?? null,
   };
+}
+
+export function resolveCollectionPostLimit(explicitLimit, configuredMaxPosts, candidateCount) {
+  if (Number.isFinite(explicitLimit) && explicitLimit > 0) return Math.min(explicitLimit, candidateCount);
+  const configured = Number(configuredMaxPosts);
+  if (Number.isFinite(configured) && configured > 0) return Math.min(Math.floor(configured), candidateCount);
+  return candidateCount;
 }
 
 async function loadConfig(configArg, cliQuery = null) {
@@ -318,20 +326,10 @@ async function discover(page, config) {
   return { candidates: rankedCandidates, discoveryDiagnostics };
 }
 
-async function switchCommentSortToAllComments(page, postId, testSortSwitch = false) {
+async function switchCommentSortToAllComments(page, surface, testSortSwitch = false) {
   try {
-    const dialogs = page.locator('[role="dialog"], [aria-modal="true"]');
-    const dialogCount = await dialogs.count();
-    let surface = page.locator('body');
-    for (let i = 0; i < dialogCount; i += 1) {
-      const d = dialogs.nth(i);
-      const isVis = await d.isVisible().catch(() => false);
-      if (!isVis) continue;
-      const text = await d.innerText().catch(() => '');
-      if (text.includes(postId) || (await d.locator(`a[href*="${postId}"]`).count()) > 0 || (await d.locator('[role="article"]').count()) > 0) {
-        surface = d;
-        break;
-      }
+    if (!(await surface.isVisible().catch(() => false))) {
+      throw new Error('Verified root surface is no longer visible');
     }
 
     let findTrigger = await surface.evaluate((root) => {
@@ -434,34 +432,8 @@ async function switchCommentSortToAllComments(page, postId, testSortSwitch = fal
     }
 
     if (clicked) {
-      // Reactive wait for sort text to change to 'Tất cả bình luận'
-      const recheckResult = await page.waitForFunction(() => {
-        const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
-        const matchingDialog = dialogs.find((d) => {
-          if (!d.offsetParent && d.offsetWidth === 0 && d.offsetHeight === 0) return false;
-          const text = d.innerText || '';
-          return text.includes('bình luận') || text.includes('comments') || d.querySelectorAll('[role="article"]').length > 0;
-        }) || document.querySelector('[role="main"]') || document.body;
-
-        const clickables = [...matchingDialog.querySelectorAll('button, [role="button"], div[aria-haspopup="menu"], div[tabindex]')];
-        for (const el of clickables) {
-          const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-          if (/^(?:tất cả bình luận|all comments)$/i.test(text)) return text;
-        }
-        return false;
-      }, { timeout: 3500 }).catch(() => null);
-
-      if (recheckResult) {
-        const textVal = typeof recheckResult.jsonValue === 'function' ? await recheckResult.jsonValue() : 'Tất cả bình luận';
-        console.log(`[sort] final="${textVal}" switched=true verified=true`);
-        return {
-          initial: findTrigger.text,
-          final: textVal,
-          switched: true,
-          verified: true,
-        };
-      }
-
+      // Re-check only the verified root's own surface. A different dialog
+      // displaying the same post id cannot confirm this transition.
       const recheckText = await surface.evaluate((root) => {
         const clickables = [...root.querySelectorAll('button, [role="button"], div[aria-haspopup="menu"], div[tabindex]')];
         for (const el of clickables) {
@@ -508,29 +480,17 @@ async function switchCommentSortToAllComments(page, postId, testSortSwitch = fal
   }
 }
 
-async function expandPost(page, postId, config, testSortSwitch = false) {
+async function expandPost(page, strictSurface, config, testSortSwitch = false) {
   const maxRounds = config.collection.expandRounds ?? 80;
   const maxClicksPerRound = config.collection.maxClicksPerRound ?? 30;
   const tolerance = 80;
 
-  // 1. Detect post surface & actively switch sort mode to "Tất cả bình luận"
-  const commentSort = await switchCommentSortToAllComments(page, postId, testSortSwitch);
-
-  const initInfo = await page.evaluate(({ postId }) => {
-    const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
-    const matchingDialog = dialogs.find((d) => {
-      if (!d.offsetParent && d.offsetWidth === 0 && d.offsetHeight === 0) return false;
-      const text = d.innerText || '';
-      return text.includes(postId) || !!d.querySelector(`a[href*="${postId}"]`);
-    }) || dialogs.find((d) => {
-      return d.querySelectorAll('[role="article"]').length > 0 && (d.offsetHeight > 200 || (d.innerText || '').length > 200);
-    }) || null;
-
-    const surface = matchingDialog || document.querySelector('[role="main"]') || document.querySelector('main') || document.body;
-    const surfaceType = matchingDialog ? 'dialog' : (document.querySelector('[role="main"]') || document.querySelector('main') ? 'main' : 'body');
-
-    return { surfaceType };
-  }, { postId });
+  // The caller resolved this surface from the one strict root article. Do not
+  // rediscover a dialog by post-id text, because comment/reply links carry it.
+  const commentSort = await switchCommentSortToAllComments(page, strictSurface, testSortSwitch);
+  const initInfo = await strictSurface.evaluate((surface) => ({
+    surfaceType: (surface.getAttribute('role') === 'dialog' || surface.getAttribute('aria-modal') === 'true') ? 'dialog' : 'main',
+  }));
 
   let prevArticles = 0;
   let prevScrollHeight = 0;
@@ -542,20 +502,9 @@ async function expandPost(page, postId, config, testSortSwitch = false) {
   const initialWindowScrollY = await page.evaluate(() => window.scrollY);
 
   for (let round = 1; round <= maxRounds; round += 1) {
-    const stepResult = await page.evaluate(async ({ postId, maxClicksPerRound, expandRegexesSrc, tolerance, initialWindowScrollY }) => {
+    const stepResult = await strictSurface.evaluate(async (surface, { maxClicksPerRound, expandRegexesSrc, tolerance, initialWindowScrollY }) => {
       const EXPAND_REGEXES = expandRegexesSrc.map((src) => new RegExp(src, 'i'));
       const isExpandText = (text) => EXPAND_REGEXES.some((re) => re.test(text));
-
-      const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
-      const matchingDialog = dialogs.find((d) => {
-        if (!d.offsetParent && d.offsetWidth === 0 && d.offsetHeight === 0) return false;
-        const text = d.innerText || '';
-        return text.includes(postId) || !!d.querySelector(`a[href*="${postId}"]`);
-      }) || dialogs.find((d) => {
-        return d.querySelectorAll('[role="article"]').length > 0 && (d.offsetHeight > 200 || (d.innerText || '').length > 200);
-      }) || null;
-
-      const surface = matchingDialog || document.querySelector('[role="main"]') || document.querySelector('main') || document.body;
 
       const findScrollContainer = (root) => {
         const candidates = [];
@@ -671,7 +620,6 @@ async function expandPost(page, postId, config, testSortSwitch = false) {
         scrollContainerReason: scrollInfo.reason,
       };
     }, {
-      postId,
       maxClicksPerRound,
       expandRegexesSrc: EXPAND_REGEXES.map((re) => re.source),
       tolerance,
@@ -708,17 +656,17 @@ async function expandPost(page, postId, config, testSortSwitch = false) {
     if (stepResult.atBottom) {
       if (stepResult.clickedTexts.length === 0 && !newBlocks && !heightIncreased) {
         // Settle window at bottom: wait up to 1500ms for delayed GraphQL lazy loading
-        const settleResult = await page.waitForFunction(({ postId, prevArticles, prevHeight }) => {
-          const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
-          const matchingDialog = dialogs.find((d) => {
-            if (!d.offsetParent && d.offsetWidth === 0 && d.offsetHeight === 0) return false;
-            const text = d.innerText || '';
-            return text.includes(postId) || !!d.querySelector(`a[href*="${postId}"]`);
-          }) || dialogs.find((d) => d.querySelectorAll('[role="article"]').length > 0) || null;
-          const surface = matchingDialog || document.querySelector('[role="main"]') || document.body;
-          const artCount = surface.querySelectorAll('[role="article"]').length;
-          return artCount > prevArticles || surface.scrollHeight > prevHeight + 20;
-        }, { postId, prevArticles, prevHeight: prevScrollHeight }, { timeout: 1500 }).catch(() => null);
+        const settleResult = await strictSurface.evaluate(async (surface, { prevArticles, prevHeight }) => {
+          const startedAt = Date.now();
+          while (Date.now() - startedAt < 1_500) {
+            if (
+              surface.querySelectorAll('[role="article"]').length > prevArticles
+              || surface.scrollHeight > prevHeight + 20
+            ) return true;
+            await new Promise((resolve) => setTimeout(resolve, 75));
+          }
+          return false;
+        }, { prevArticles, prevHeight: prevScrollHeight }).catch(() => null);
 
         if (!settleResult) {
           bottomIdleRounds += 1;
@@ -750,20 +698,10 @@ async function expandPost(page, postId, config, testSortSwitch = false) {
   const completeness = completionReason === 'bottom-stable' ? 'complete' : 'truncated';
   console.log(`\n[post] COMPLETE comments=${prevArticles} reason=${completionReason} completeness=${completeness}`);
 
-  // Scan suspicious unmatched controls on the exact target surface
-  const suspiciousUnmatched = await page.evaluate(({ postId, expandRegexesSrc }) => {
+  // Scan suspicious unmatched controls on the root-derived surface only.
+  const suspiciousUnmatched = await strictSurface.evaluate((surface, { expandRegexesSrc }) => {
     const EXPAND_REGEXES = expandRegexesSrc.map((src) => new RegExp(src, 'i'));
     const isExpandText = (text) => EXPAND_REGEXES.some((re) => re.test(text));
-    const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
-    const matchingDialog = dialogs.find((d) => {
-      if (!d.offsetParent && d.offsetWidth === 0 && d.offsetHeight === 0) return false;
-      const text = d.innerText || '';
-      return text.includes(postId) || !!d.querySelector(`a[href*="${postId}"]`);
-    }) || dialogs.find((d) => {
-      return d.querySelectorAll('[role="article"]').length > 0 && (d.offsetHeight > 200 || (d.innerText || '').length > 200);
-    }) || null;
-
-    const surface = matchingDialog || document.querySelector('[role="main"]') || document.querySelector('main') || document.body;
     const isVisible = (el) => {
       const style = window.getComputedStyle(el);
       return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && (el.offsetWidth > 0 || el.offsetHeight > 0);
@@ -782,7 +720,7 @@ async function expandPost(page, postId, config, testSortSwitch = false) {
       }
     }
     return suspicious;
-  }, { postId, expandRegexesSrc: EXPAND_REGEXES.map((re) => re.source) });
+  }, { expandRegexesSrc: EXPAND_REGEXES.map((re) => re.source) });
 
   return {
     surfaceType: initInfo.surfaceType,
@@ -802,10 +740,21 @@ async function expandPost(page, postId, config, testSortSwitch = false) {
   };
 }
 
-async function extractPostBundle(page, postId, rawHtmlMaxChars, expansion = null, strictCapture = null) {
-  return page.evaluate(({ postId, rawHtmlMaxChars, expansion, strictRootIdentity }) => {
+async function extractPostBundle(page, postId, rawHtmlMaxChars, expansion = null, strictCapture = null, strictScope = null) {
+  const strictRootHandle = strictScope ? await strictScope.root.elementHandle() : null;
+  const strictSurfaceHandle = strictScope ? await strictScope.surface.elementHandle() : null;
+  if (strictScope && (!strictRootHandle || !strictSurfaceHandle)) {
+    await strictRootHandle?.dispose();
+    await strictSurfaceHandle?.dispose();
+    throw new Error(`Verified root surface disappeared before extraction for post ${postId}`);
+  }
+  try {
+    return await page.evaluate(({ postId, rawHtmlMaxChars, expansion, strictRootIdentity, strictRootNode, strictSurfaceNode }) => {
     // 8. Extraction must use the same selected post surface
-    const strictRootMatches = (node) => [...node.querySelectorAll('a[href]')].some((anchor) => {
+    const strictRootMatches = (node) => {
+      const aria = (node.getAttribute('aria-label') || '').toLowerCase();
+      if (/\b(comment|reply|bình luận|phản hồi)\b/i.test(aria)) return false;
+      return [...node.querySelectorAll('a[href]')].some((anchor) => {
       try {
         const url = new URL(anchor.href, location.origin);
         if (url.searchParams.has('comment_id') || url.searchParams.has('reply_comment_id')) return false;
@@ -816,15 +765,24 @@ async function extractPostBundle(page, postId, rawHtmlMaxChars, expansion = null
       } catch {
         return false;
       }
-    });
+      });
+    };
+    if (strictRootNode) {
+      if (!strictSurfaceNode || !document.contains(strictRootNode) || !document.contains(strictSurfaceNode) || !strictSurfaceNode.contains(strictRootNode)) {
+        throw new Error('Verified root/surface binding was lost before extraction');
+      }
+      if (!strictRootMatches(strictRootNode)) {
+        throw new Error('Verified root no longer satisfies the strict identity contract');
+      }
+    }
     const visibleArticles = [...document.querySelectorAll('[role="article"]')].filter((node) => {
       return Boolean(node.offsetWidth || node.offsetHeight || node.getClientRects().length);
     });
-    const matchingStrictRoots = strictRootIdentity ? visibleArticles.filter(strictRootMatches) : [];
-    if (strictRootIdentity && matchingStrictRoots.length !== 1) {
+    const matchingStrictRoots = strictRootIdentity && !strictRootNode ? visibleArticles.filter(strictRootMatches) : [];
+    if (strictRootIdentity && !strictRootNode && matchingStrictRoots.length !== 1) {
       throw new Error(`Expected one strict root article, found ${matchingStrictRoots.length}`);
     }
-    const strictRoot = matchingStrictRoots[0] ?? null;
+    const strictRoot = strictRootNode ?? matchingStrictRoots[0] ?? null;
     const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
     const matchingDialog = strictRoot ? strictRoot.closest('[role="dialog"], [aria-modal="true"]') : dialogs.find((d) => {
       if (!d.offsetParent && d.offsetWidth === 0 && d.offsetHeight === 0) return false;
@@ -835,8 +793,15 @@ async function extractPostBundle(page, postId, rawHtmlMaxChars, expansion = null
     }) || null;
 
     const strictMain = strictRoot?.closest('[role="main"], main') || null;
-    const surface = strictRoot ? (matchingDialog || strictMain || document.body) : (matchingDialog || document.querySelector('[role="main"]') || document.querySelector('main') || document.body);
-    const surfaceType = matchingDialog ? 'dialog' : (strictMain || document.querySelector('[role="main"]') || document.querySelector('main') ? 'main' : 'body');
+    if (strictRoot && !strictSurfaceNode && !matchingDialog && !strictMain) {
+      throw new Error('Verified root has no dialog/main extraction surface');
+    }
+    const surface = strictRoot
+      ? (strictSurfaceNode || matchingDialog || strictMain)
+      : (matchingDialog || document.querySelector('[role="main"]') || document.querySelector('main') || document.body);
+    const surfaceType = (surface.getAttribute('role') === 'dialog' || surface.getAttribute('aria-modal') === 'true')
+      ? 'dialog'
+      : (surface.getAttribute('role') === 'main' || surface.tagName.toLowerCase() === 'main' ? 'main' : 'body');
 
     // Scoped article blocks strictly within the detected post surface
     const allArticles = [...surface.querySelectorAll('[role="article"]')];
@@ -1071,12 +1036,18 @@ async function extractPostBundle(page, postId, rawHtmlMaxChars, expansion = null
         htmlTruncated: html.length > rawHtmlMaxChars,
       },
     };
-  }, {
-    postId,
-    rawHtmlMaxChars,
-    expansion,
-    strictRootIdentity: strictCapture?.identity ?? null,
-  });
+    }, {
+      postId,
+      rawHtmlMaxChars,
+      expansion,
+      strictRootIdentity: strictCapture?.identity ?? null,
+      strictRootNode: strictRootHandle,
+      strictSurfaceNode: strictSurfaceHandle,
+    });
+  } finally {
+    await strictRootHandle?.dispose();
+    await strictSurfaceHandle?.dispose();
+  }
 }
 
 export const ACCEPTANCE_VERSION = DEEP_COLLECTION_ACCEPTANCE_VERSION;
@@ -1373,10 +1344,9 @@ async function collect(config, options = {}) {
       return;
     }
 
-    // Mode 1: Collect ALL Discovered Posts (ranking prioritized by relevance, bounded only if explicit --limit is set)
-    const maxPosts = Number.isFinite(options.limit) && options.limit > 0
-      ? options.limit
-      : ranked.length;
+    // Default runs honor the configured safety budget. --limit is an explicit
+    // operator override for a deliberately bounded live validation.
+    const maxPosts = resolveCollectionPostLimit(options.limit, config.collection.maxPosts, ranked.length);
     const selected = ranked.slice(0, maxPosts);
 
     console.log(`\n[select] ${candidates.length} discovered candidates, attempting collection for ${selected.length} posts`);
@@ -1441,11 +1411,17 @@ async function collect(config, options = {}) {
         attempt += 1;
         try {
           let strictCapture = null;
+          let strictSurface = null;
+          let strictScope = null;
           if (candidate.strictBody) {
             strictCapture = await captureStrictRootBody(page, candidate, {
               allowedGroupIdentifiers: candidate.allowedGroupIdentifiers ?? [],
             });
             assertReviewedBodyIsCurrent(candidate, strictCapture);
+            strictScope = await resolveStrictRootSurface(page, strictCapture.validation);
+            strictCapture.root = strictScope.root;
+            strictCapture.surfaceType = strictScope.surfaceType;
+            strictSurface = strictScope.surface;
             candidate.groupId = strictCapture.identity.groupIdentifier;
             candidate.groupIdentifier = strictCapture.identity.groupIdentifier;
             candidate.canonicalUrl = strictCapture.identity.canonicalUrl;
@@ -1454,8 +1430,18 @@ async function collect(config, options = {}) {
           } else {
             await page.goto(candidate.canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
           }
-          const expansion = await expandPost(page, candidate.postId, config, options.testSortSwitch);
-          const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars, expansion, strictCapture);
+          // Direct legacy/debug invocation may still inspect a page, but it is
+          // stamped legacy-unverified and can never establish reusable
+          // evidence. The default v2 path always supplies strictSurface.
+          const expansion = await expandPost(page, strictSurface ?? page.locator('body'), config, options.testSortSwitch);
+          if (strictCapture) {
+            // Comment expansion can re-render the post surface. Re-resolve the
+            // exact root contract immediately before extracting comments; if it
+            // is no longer unique, fail/retry instead of reading another UI.
+            strictScope = await resolveStrictRootSurface(page, strictCapture.validation);
+            strictCapture.root = strictScope.root;
+          }
+          const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars, expansion, strictCapture, strictScope);
           const normalized = normalizeBundle(candidate, bundle, config, strictCapture);
 
           await atomicWriteJson(path.join(rawDir, `${candidate.postId}.json`), {

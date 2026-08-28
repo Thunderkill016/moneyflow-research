@@ -36,7 +36,7 @@ async function loadConfig(configArg) {
     corpus: {
       indexPath: './corpus/index.json',
       cacheDir: './corpus/posts',
-      acceptedAcceptanceVersions: ['v0.8-strict-deep-collection-v1'],
+      acceptedAcceptanceVersions: ['v0.8-strict-deep-collection-v2'],
       ...parsed.corpus,
     },
   };

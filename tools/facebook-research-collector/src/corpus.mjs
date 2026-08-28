@@ -200,6 +200,46 @@ export function upsertDiscovery(registry, candidate, queries = [], now = new Dat
   return record;
 }
 
+/**
+ * Move an untrusted/preflight record to the exact source key proven by a
+ * strict browser capture. This is deliberately fail-closed: a target key that
+ * already belongs to a different record is a provenance conflict, not a cue
+ * to merge aliases or evidence automatically.
+ */
+export function rekeyCorpusRecord(registry, record, sourceKey, { resetUntrustedCache = false } = {}) {
+  const nextKey = String(sourceKey ?? '').trim();
+  const currentKey = String(record?.sourceKey ?? '').trim();
+  if (!nextKey) throw new Error('Cannot rekey corpus record without an exact source key');
+  if (!currentKey) throw new Error('Cannot rekey corpus record without its current source key');
+  if (currentKey === nextKey) return record;
+  if (registry?.posts?.[currentKey] !== record) {
+    throw new Error(`Cannot rekey corpus record ${currentKey}: registry ownership changed`);
+  }
+  if (registry.posts[nextKey] && registry.posts[nextKey] !== record) {
+    throw new Error(`Cannot rekey corpus record ${currentKey}: target source key ${nextKey} already exists`);
+  }
+  if (record.status === 'complete' || record.cacheFile) {
+    if (!resetUntrustedCache) {
+      throw new Error(`Cannot rekey reusable corpus evidence ${currentKey} without an explicit cache migration`);
+    }
+    // The caller only opts into this after the old record failed the current
+    // acceptance gate and a browser capture proved the new identity. Keep the
+    // old cache file local but detach it from the registry so it cannot be
+    // reused as evidence under the resolved source key.
+    record.status = 'seen';
+    record.acceptanceVersion = null;
+    record.cacheFile = null;
+    record.commentCount = null;
+  }
+
+  delete registry.posts[currentKey];
+  record.sourceKey = nextKey;
+  record.source ??= {};
+  record.source.key = nextKey;
+  registry.posts[nextKey] = record;
+  return record;
+}
+
 export function recordBodyPreflight(registry, candidate, preflight, query) {
   const record = upsertDiscovery(registry, candidate, query ? [query] : []);
   const body = preflight.body ?? '';
