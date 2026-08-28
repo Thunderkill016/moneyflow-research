@@ -7,13 +7,6 @@
         "1569314343856132",
         "indiehackervn"
       ]
-    },
-    {
-      "id": "j2team.community",
-      "name": "J2TEAM Community",
-      "aliases": [
-        "j2team.community"
-      ]
     }
   ],
   "group": {
@@ -23,128 +16,32 @@
       "1569314343856132",
       "indiehackervn"
     ],
-    "note": "Backward-compatible single-group fallback. Default discovery uses groups[]."
+    "note": "Backward-compatible single-group fallback."
   },
   "queryPlan": {
-    "version": "pfm-corpus-v1",
-    "sourceRun": "2026-08-27T19-01-01-462Z",
-    "strategy": "two-group-focused-full-body-assessor-gate",
-    "primaryQueries": [
-      "quản lý chi tiêu",
-      "quản lý thu chi",
-      "tài chính cá nhân",
-      "ghi chép chi tiêu",
-      "theo dõi chi tiêu",
-      "expense tracker",
-      "personal finance",
-      "nhập liệu chi tiêu",
-      "tự động ghi chi tiêu",
-      "đồng bộ giao dịch ngân hàng",
-      "sao kê ngân hàng chi tiêu",
-      "biến động số dư chi tiêu",
-      "giao dịch ngân hàng chi tiêu",
-      "ví điện tử chi tiêu",
-      "momo quản lý chi tiêu",
-      "sepay quản lý chi tiêu",
-      "tiền mặt quản lý chi tiêu",
-      "email giao dịch ngân hàng",
-      "giọng nói quản lý chi tiêu",
-      "ocr chi tiêu",
-      "telegram quản lý chi tiêu",
-      "zalo bot quản lý chi tiêu",
-      "ngôn ngữ tự nhiên chi tiêu",
-      "google sheet quản lý chi tiêu",
-      "nhiều tài khoản quản lý chi tiêu",
-      "nhiều ví quản lý chi tiêu",
-      "duplicate giao dịch chi tiêu",
-      "chuyển tiền giữa ví",
-      "phân loại giao dịch chi tiêu",
-      "bảo mật app chi tiêu",
-      "ngân sách cá nhân",
-      "mục tiêu tiết kiệm",
-      "chi tiêu định kỳ",
-      "money lover chi tiêu",
-      "misa thu chi"
-    ],
-    "secondaryQueries": [
-      "quản lý tài chính",
-      "quản lý tiền cá nhân",
-      "nhập tay chi tiêu",
-      "tự động nhập giao dịch",
-      "quên nhập chi tiêu",
-      "không cần mở app chi tiêu",
-      "zalopay quản lý chi tiêu",
-      "apple pay expense tracker",
-      "voice expense tracker",
-      "scan hóa đơn chi tiêu",
-      "widget chi tiêu",
-      "shortcut chi tiêu",
-      "nguồn tiền chi tiêu",
-      "transfer transaction expense",
-      "sửa giao dịch chi tiêu",
-      "xóa giao dịch chi tiêu",
-      "mã hóa tài chính cá nhân",
-      "subscription chi tiêu",
-      "6 hũ tài chính",
-      "quản lý tài sản cá nhân",
-      "báo cáo chi tiêu",
-      "rolly quản lý chi tiêu",
-      "excel quản lý chi tiêu"
-    ]
+    "version": "pfm-corpus-v2",
+    "strategy": "build-in-public-corpus-first-offline-review",
+    "rationale": "Use a small broad query set to surface the reusable corpus once. Prior narrow-query pilots had high review cost and zero marginal relevant yield."
   },
   "queries": [
     "quản lý chi tiêu",
     "quản lý thu chi",
-    "tài chính cá nhân",
-    "ghi chép chi tiêu",
-    "theo dõi chi tiêu",
-    "expense tracker",
-    "personal finance",
-    "nhập liệu chi tiêu",
-    "tự động ghi chi tiêu",
-    "đồng bộ giao dịch ngân hàng",
-    "sao kê ngân hàng chi tiêu",
-    "biến động số dư chi tiêu",
-    "giao dịch ngân hàng chi tiêu",
-    "ví điện tử chi tiêu",
-    "momo quản lý chi tiêu",
-    "sepay quản lý chi tiêu",
-    "tiền mặt quản lý chi tiêu",
-    "email giao dịch ngân hàng",
-    "giọng nói quản lý chi tiêu",
-    "ocr chi tiêu",
-    "telegram quản lý chi tiêu",
-    "zalo bot quản lý chi tiêu",
-    "ngôn ngữ tự nhiên chi tiêu",
-    "google sheet quản lý chi tiêu",
-    "nhiều tài khoản quản lý chi tiêu",
-    "nhiều ví quản lý chi tiêu",
-    "duplicate giao dịch chi tiêu",
-    "chuyển tiền giữa ví",
-    "phân loại giao dịch chi tiêu",
-    "bảo mật app chi tiêu",
-    "ngân sách cá nhân",
-    "mục tiêu tiết kiệm",
-    "chi tiêu định kỳ",
-    "money lover chi tiêu",
-    "misa thu chi"
+    "app quản lý chi tiêu",
+    "sổ thu chi",
+    "app tài chính cá nhân"
   ],
   "browser": {
     "headless": false,
     "profileDir": "./profile",
     "locale": "vi-VN"
   },
-  "pacing": {
-    "minMs": 1400,
-    "maxMs": 3200
-  },
   "discovery": {
     "scope": "group",
-    "safetyCapRounds": 150,
-    "scrollPixels": 1400,
+    "safetyCapRounds": 120,
+    "scrollPixels": 1800,
     "stableBottomRounds": 3,
     "bottomTolerancePx": 100,
-    "settleMs": 700,
+    "settleMs": 450,
     "progressEveryRounds": 10,
     "maxCandidatesPerQuery": 500
   },
@@ -161,7 +58,11 @@
     "topicLabel": "quản lý chi tiêu / tài chính cá nhân",
     "bodyCaptureRetries": 2,
     "bodyCaptureRetryDelayMs": 800,
-    "preflightBatchSize": 10
+    "preflightBatchSize": 10,
+    "note": "preflightBatchSize is retained for the legacy review-preflight path. v0.9 default prepares review offline after body harvest."
+  },
+  "harvest": {
+    "checkpointEvery": 10
   },
   "collection": {
     "maxPosts": 25,
