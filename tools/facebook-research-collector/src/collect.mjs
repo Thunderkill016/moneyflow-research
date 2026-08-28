@@ -48,7 +48,7 @@ export function parseCollectCli(rawArgs = process.argv.slice(2)) {
 }
 
 async function runReviewRunner(args) {
-  const runner = fileURLToPath(new URL('./review-topic-runner.mjs', import.meta.url));
+  const runner = fileURLToPath(new URL('./review-topic-runner-v2.mjs', import.meta.url));
   await new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [runner, ...args], {
       cwd: process.cwd(),
@@ -58,7 +58,7 @@ async function runReviewRunner(args) {
     child.on('error', reject);
     child.on('exit', (code, signal) => {
       if (code === 0) resolve();
-      else reject(new Error(`review-topic-runner failed (code=${code}, signal=${signal ?? 'none'})`));
+      else reject(new Error(`review-topic-runner-v2 failed (code=${code}, signal=${signal ?? 'none'})`));
     });
   });
 }
