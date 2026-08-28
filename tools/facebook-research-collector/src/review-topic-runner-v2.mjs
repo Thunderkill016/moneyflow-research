@@ -647,8 +647,12 @@ async function applyReview({ review, decisions, cli, config, registry, indexPath
         queries: row.queries,
         allowedGroupIdentifiers: row.bodyValidation?.allowedGroupIdentifiers ?? [row.sourceGroupIdentifier],
         strictBody: {
+          body: row.body,
           bodyContentHash: row.bodyContentHash,
           bodyAcceptanceVersion: row.bodyValidation?.acceptanceVersion ?? null,
+          bodySource: row.bodySource ?? null,
+          capturedAt: row.bodyValidation?.capturedAt ?? null,
+          fullBodyCaptures: 1,
           validation: row.bodyValidation,
         },
       };
