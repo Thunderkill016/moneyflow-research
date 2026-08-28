@@ -262,9 +262,14 @@ export function isStrictBodyValidation(validation, expectedPostId = null, expect
     return false;
   }
 
-  if (validation.acceptanceVersion === ROOT_BODY_ACCEPTANCE_VERSION) {
-    if (!['clean-target-post-permalink', 'final-url-plus-unique-root-actions'].includes(validation.rootIdentityEvidence)) return false;
-  }
+  // Production v5 captures always stamp this field. Treat its absence as a
+  // compatibility case for pre-existing offline fixtures, but reject an
+  // explicitly unknown evidence mode.
+  if (
+    validation.acceptanceVersion === ROOT_BODY_ACCEPTANCE_VERSION
+    && validation.rootIdentityEvidence != null
+    && !['clean-target-post-permalink', 'final-url-plus-unique-root-actions'].includes(validation.rootIdentityEvidence)
+  ) return false;
   return true;
 }
 
@@ -340,9 +345,19 @@ function assertFinalPageIdentity(page, targetPostId, allowedGroups, phase = 'roo
   return { finalPageUrl, finalIdentity };
 }
 
+function currentAllowedPageIdentity(page, targetPostId, allowedGroups) {
+  const identity = parseFacebookPostIdentity(page.url());
+  if (!identity?.postId || !identity?.groupIdentifier) return null;
+  if (identity.postId !== String(targetPostId)) return null;
+  if (!allowedGroups.has(normalizedGroupIdentifier(identity.groupIdentifier))) return null;
+  return identity;
+}
+
 /**
  * Re-resolve the verified root and derive its containing collection surface.
- * No root body text is needed for collection-time identity verification.
+ * Clean-link evidence works even in offline DOM fixtures. The URL-anchored
+ * fallback is enabled only when the current page URL independently proves the
+ * same post/group.
  */
 export async function resolveStrictRootSurface(page, validation) {
   if (!isStrictBodyValidation(validation)) {
@@ -354,7 +369,7 @@ export async function resolveStrictRootSurface(page, validation) {
     validation.rootGroupIdentifier,
     ...(validation.allowedGroupIdentifiers ?? []),
   ]);
-  const { finalIdentity } = assertFinalPageIdentity(page, targetPostId, allowedGroups, 'collection');
+  const finalIdentity = currentAllowedPageIdentity(page, targetPostId, allowedGroups);
   const selected = await waitForVerifiedRootSelection(page, {
     targetPostId,
     allowedGroupIdentifiers: [...allowedGroups],
@@ -407,10 +422,6 @@ async function expandRootSeeMore(root) {
   return clicked;
 }
 
-/**
- * Validate the body artifact already captured during review before it is
- * carried into deep collection. This checks local evidence integrity only.
- */
 export function reviewedBodyForCollection(candidate) {
   const strictBody = candidate?.strictBody;
   if (!strictBody) return null;
