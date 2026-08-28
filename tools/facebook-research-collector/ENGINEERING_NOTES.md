@@ -174,6 +174,8 @@ Review queue schema v2 carries `bodyContentHash`; a decisions file must echo it.
 #### Failure semantics
 
 - body capture retries are bounded (`bodyCaptureRetries`, default 2);
+- review preparation is bounded (`preflightBatchSize`, default 10) and checkpoints each successfully verified root body before moving to the next candidate;
+- `review-preparation.json` records progress, batch/deferred accounting, and the last safe candidate checkpoint without storing browser-session data;
 - failures are written to `body-capture-failures.json`;
 - any body-capture failure blocks the run from being treated as a complete review preparation;
 - no assessor should label a failed/partial queue as though all candidates were verified.

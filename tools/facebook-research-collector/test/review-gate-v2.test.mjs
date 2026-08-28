@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { hashText } from '../src/corpus.mjs';
+import { emptyRegistry, hashText, loadCorpusRegistry, saveCorpusRegistry } from '../src/corpus.mjs';
 import { assertReviewedBodyIsCurrent } from '../src/index.mjs';
-import { assertReviewRowStillCurrent } from '../src/review-topic-runner-v2.mjs';
+import { assertReviewRowStillCurrent, prepareReview, resolveReviewPreflightBatchSize } from '../src/review-topic-runner-v2.mjs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -55,6 +55,40 @@ function record({ status = 'seen', acceptanceVersion = null, cacheFile = null, b
     },
     body,
     topicClassifications: {},
+  };
+}
+
+function candidate(postId) {
+  return {
+    postId: String(postId),
+    key: `facebook:${GROUP}:${postId}`,
+    corpusKey: `facebook:${GROUP}:${postId}`,
+    groupId: GROUP,
+    groupIdentifier: GROUP,
+    canonicalUrl: `https://www.facebook.com/groups/${GROUP}/permalink/${postId}/`,
+    queries: ['quản lý chi tiêu'],
+  };
+}
+
+function capturedRoot(candidateRow) {
+  const postId = String(candidateRow.postId);
+  const canonicalUrl = `https://www.facebook.com/groups/${GROUP}/permalink/${postId}/`;
+  return {
+    body: `Verified root body ${postId}`,
+    capturedAt: '2026-08-28T00:00:00.000Z',
+    finalPageUrl: canonicalUrl,
+    identity: {
+      postId,
+      groupIdentifier: GROUP,
+      key: `facebook:${GROUP}:${postId}`,
+      canonicalUrl,
+    },
+    validation: strictValidation({
+      targetPostId: postId,
+      rootPostId: postId,
+      finalPostId: postId,
+    }),
+    selectionDiagnostics: { eligibleIndexes: [0] },
   };
 }
 
@@ -264,6 +298,93 @@ test('apply-time reuse rejects a strict cache whose reviewed body changed', asyn
       bodyContentHash: hashText(reviewedBody),
     }, [DEEP_COLLECTION_ACCEPTANCE_VERSION]),
     /Complete record body changed after review preparation/,
+  );
+});
+
+test('review preparation batches uncached bodies and resumes from strict checkpoints', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'moneyflow-review-batch-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const runDir = path.join(root, 'review');
+  const indexPath = path.join(root, 'corpus', 'index.json');
+  await fs.mkdir(runDir, { recursive: true });
+
+  const discovery = { candidates: [candidate('1'), candidate('2'), candidate('3')] };
+  const config = {
+    groups: [{ id: GROUP }],
+    corpus: { acceptedAcceptanceVersions: [DEEP_COLLECTION_ACCEPTANCE_VERSION] },
+    review: {
+      topicKey: 'personal-expense-management',
+      topicLabel: 'PFM',
+      preflightBatchSize: 2,
+      bodyCaptureRetries: 1,
+      bodyCaptureRetryDelayMs: 0,
+    },
+  };
+  const captures = [];
+  let contextsClosed = 0;
+  const dependencies = {
+    openReviewContext: async () => ({ page: {}, context: { close: async () => { contextsClosed += 1; } } }),
+    captureRootBodyWithRetries: async (_page, candidateRow) => {
+      captures.push(candidateRow.postId);
+      return capturedRoot(candidateRow);
+    },
+  };
+
+  const first = await prepareReview({
+    discovery,
+    cli: { limit: null, query: 'quản lý chi tiêu' },
+    config,
+    registry: emptyRegistry(),
+    indexPath,
+    runDir,
+    ...dependencies,
+  });
+
+  assert.deepEqual(captures, ['1', '2']);
+  assert.equal(first.queue.length, 2);
+  assert.equal(first.deferredCandidates, 1);
+  assert.equal(first.capturedBodies, 2);
+  assert.equal(contextsClosed, 1);
+  const firstRegistry = await loadCorpusRegistry(indexPath);
+  assert.deepEqual(Object.keys(firstRegistry.posts).sort(), [`facebook:${GROUP}:1`, `facebook:${GROUP}:2`]);
+  const firstProgress = JSON.parse(await fs.readFile(path.join(runDir, 'review-preparation.json'), 'utf8'));
+  assert.equal(firstProgress.status, 'prepared');
+  assert.equal(firstProgress.deferredCandidates, 1);
+
+  for (const sourceKey of Object.keys(firstRegistry.posts)) {
+    const stored = firstRegistry.posts[sourceKey];
+    stored.topicClassifications = {
+      'personal-expense-management': {
+        relevant: false,
+        bodyContentHash: stored.body.contentHash,
+        bodyAcceptanceVersion: ROOT_BODY_ACCEPTANCE_VERSION,
+      },
+    };
+  }
+  await saveCorpusRegistry(indexPath, firstRegistry);
+
+  const second = await prepareReview({
+    discovery,
+    cli: { limit: null, query: 'quản lý chi tiêu' },
+    config,
+    registry: await loadCorpusRegistry(indexPath),
+    indexPath,
+    runDir,
+    ...dependencies,
+  });
+  assert.deepEqual(captures, ['1', '2', '3']);
+  assert.equal(second.alreadyJudged.length, 2);
+  assert.deepEqual(second.queue.map((row) => row.postId), ['3']);
+  assert.equal(second.capturedBodies, 1);
+  assert.equal(second.deferredCandidates, 0);
+});
+
+test('explicit limit bounds a review preflight batch and malformed batch config fails closed', () => {
+  assert.equal(resolveReviewPreflightBatchSize(1, { preflightBatchSize: 10 }), 1);
+  assert.equal(resolveReviewPreflightBatchSize(null, { preflightBatchSize: 3 }), 3);
+  assert.throws(
+    () => resolveReviewPreflightBatchSize(null, { preflightBatchSize: 0 }),
+    /preflightBatchSize must be a positive integer/,
   );
 });
 

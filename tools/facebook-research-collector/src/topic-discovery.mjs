@@ -5,6 +5,8 @@ import { parseArgs } from 'node:util';
 import { chromium } from 'playwright';
 import { atomicWriteJson, parseFacebookPostIdentity } from './corpus.mjs';
 
+const DEFAULT_DISCOVERY_PROGRESS_EVERY_ROUNDS = 10;
+
 function timestampSlug() {
   return new Date().toISOString().replace(/[:.]/g, '-');
 }
@@ -115,6 +117,14 @@ export function buildSearchUrl({ scope = 'group', groupId = null, query }) {
   return `https://www.facebook.com/search/posts/?q=${encodeURIComponent(query)}`;
 }
 
+export function resolveDiscoveryProgressEveryRounds(discoveryConfig = {}) {
+  const configured = Number(discoveryConfig.progressEveryRounds ?? DEFAULT_DISCOVERY_PROGRESS_EVERY_ROUNDS);
+  if (!Number.isInteger(configured) || configured <= 0) {
+    throw new Error(`discovery.progressEveryRounds must be a positive integer, received ${JSON.stringify(discoveryConfig.progressEveryRounds)}`);
+  }
+  return configured;
+}
+
 function permalinkLikelihood(link) {
   const label = normalizeWhitespace(`${link.text ?? ''} ${link.ariaLabel ?? ''}`);
   let score = 0;
@@ -213,6 +223,7 @@ async function discoverQuery(page, config, query, globalCandidates, target) {
   const cap = Number(config.discovery.maxCandidatesPerQuery ?? 500);
   const tolerance = Number(config.discovery.bottomTolerancePx ?? 100);
   const requiredStable = Number(config.discovery.stableBottomRounds ?? 3);
+  const progressEveryRounds = resolveDiscoveryProgressEveryRounds(config.discovery);
   const queryKeys = new Set();
 
   for (let round = 1; round <= maxRounds; round += 1) {
@@ -285,11 +296,17 @@ async function discoverQuery(page, config, query, globalCandidates, target) {
       stableBottomRounds: stableBottom,
     });
 
-    if (queryKeys.size >= cap) {
+    const reachedCandidateCap = queryKeys.size >= cap;
+    const reachedStableBottom = stableBottom >= requiredStable;
+    if (round === 1 || round % progressEveryRounds === 0 || reachedCandidateCap || reachedStableBottom) {
+      console.log(`[topic-discovery] group=${groupId ?? 'global'} round=${round}/${maxRounds} candidates=${queryKeys.size} cards=${cards.length} new=${newThisRound} bottomStable=${stableBottom}/${requiredStable}`);
+    }
+
+    if (reachedCandidateCap) {
       completionReason = 'candidate-cap';
       break;
     }
-    if (stableBottom >= requiredStable) {
+    if (reachedStableBottom) {
       completionReason = 'bottom-stable';
       break;
     }

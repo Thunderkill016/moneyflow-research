@@ -29,6 +29,10 @@ import {
 } from './root-body.mjs';
 
 const REVIEW_QUEUE_SCHEMA_VERSION = 2;
+const REVIEW_PREPARATION_SCHEMA_VERSION = 1;
+// A review batch is deliberately small: each uncached item requires a real
+// Facebook navigation before an external assessor can decide relevance.
+const DEFAULT_PREFLIGHT_BATCH_SIZE = 10;
 
 function timestampSlug() {
   return new Date().toISOString().replace(/[:.]/g, '-');
@@ -101,6 +105,7 @@ async function loadConfig(configArg) {
       topicLabel: 'quản lý chi tiêu / tài chính cá nhân',
       bodyCaptureRetries: 2,
       bodyCaptureRetryDelayMs: 800,
+      preflightBatchSize: DEFAULT_PREFLIGHT_BATCH_SIZE,
       ...parsed.review,
     },
   };
@@ -291,15 +296,100 @@ function priorJudgment(record, topicKey, acceptedVersions) {
   return { judgment: trust.trusted ? judgment : null, trust };
 }
 
-async function prepareReview({ discovery, cli, config, registry, indexPath, runDir }) {
+export function resolveReviewPreflightBatchSize(cliLimit, reviewConfig = {}) {
+  if (Number.isInteger(cliLimit) && cliLimit > 0) return cliLimit;
+  const configured = Number(reviewConfig.preflightBatchSize ?? DEFAULT_PREFLIGHT_BATCH_SIZE);
+  if (!Number.isInteger(configured) || configured <= 0) {
+    throw new Error(`review.preflightBatchSize must be a positive integer, received ${JSON.stringify(reviewConfig.preflightBatchSize)}`);
+  }
+  return configured;
+}
+
+function preparationState({
+  status,
+  startedAt,
+  discoveryCandidateCount,
+  preflightBatchSize,
+  processedCandidates,
+  capturedBodies,
+  trustedBodies,
+  queued,
+  alreadyJudged,
+  bodyCaptureFailures,
+  deferredCandidates,
+  lastCandidate = null,
+}) {
+  return {
+    schemaVersion: REVIEW_PREPARATION_SCHEMA_VERSION,
+    phase: 'strict-root-body-preparation',
+    status,
+    startedAt,
+    updatedAt: new Date().toISOString(),
+    discoveryCandidateCount,
+    preflightBatchSize,
+    processedCandidates,
+    capturedBodies,
+    trustedBodies,
+    queued,
+    alreadyJudged,
+    bodyCaptureFailures,
+    deferredCandidates,
+    lastCandidate,
+  };
+}
+
+async function savePreparationProgress(runDir, state) {
+  await atomicWriteJson(path.join(runDir, 'review-preparation.json'), state);
+}
+
+export async function prepareReview({
+  discovery,
+  cli,
+  config,
+  registry,
+  indexPath,
+  runDir,
+  openReviewContext = openContext,
+  captureRootBodyWithRetries = extractRootBodyWithRetries,
+}) {
   const queue = [];
   const alreadyJudged = [];
   const failures = [];
   const diagnostics = [];
+  const startedAt = new Date().toISOString();
+  const preflightBatchSize = resolveReviewPreflightBatchSize(cli.limit, config.review);
+  let processedCandidates = 0;
+  let capturedBodies = 0;
+  let trustedBodies = 0;
+  let deferredCandidates = 0;
+  let lastCandidate = null;
   let browser = null;
+
+  const checkpoint = async (status) => {
+    await savePreparationProgress(runDir, preparationState({
+      status,
+      startedAt,
+      discoveryCandidateCount: discovery.candidates.length,
+      preflightBatchSize,
+      processedCandidates,
+      capturedBodies,
+      trustedBodies,
+      queued: queue.length,
+      alreadyJudged: alreadyJudged.length,
+      bodyCaptureFailures: failures.length,
+      deferredCandidates,
+      lastCandidate,
+    }));
+  };
+
+  await checkpoint('preparing');
 
   try {
     for (let i = 0; i < discovery.candidates.length; i += 1) {
+      if (queue.length >= preflightBatchSize) {
+        deferredCandidates = discovery.candidates.length - i;
+        break;
+      }
       const candidate = structuredClone(discovery.candidates[i]);
       candidate.allowedGroupIdentifiers = explicitGroupAliasesForCandidate(candidate, config);
       const queries = [...new Set([...(candidate.queries ?? []), ...(cli.query ? [cli.query] : [])].filter(Boolean))];
@@ -311,6 +401,9 @@ async function prepareReview({ discovery, cli, config, registry, indexPath, runD
       } catch (error) {
         failures.push({ postId: candidate.postId, phase: 'load-trusted-body', message: error.message, code: error.code ?? null });
         diagnostics.push({ postId: candidate.postId, beforeTrust, failure: failures.at(-1) });
+        processedCandidates += 1;
+        lastCandidate = { index: i, postId: String(candidate.postId), outcome: 'load-trusted-body-failed' };
+        await checkpoint('preparing');
         continue;
       }
 
@@ -320,9 +413,9 @@ async function prepareReview({ discovery, cli, config, registry, indexPath, runD
       let capture = null;
 
       if (!loaded.trusted) {
-        browser ??= await openContext(config);
+        browser ??= await openReviewContext(config);
         try {
-          capture = await extractRootBodyWithRetries(browser.page, candidate, config);
+          capture = await captureRootBodyWithRetries(browser.page, candidate, config);
         } catch (error) {
           failures.push({
             postId: candidate.postId,
@@ -332,6 +425,9 @@ async function prepareReview({ discovery, cli, config, registry, indexPath, runD
             attempts: error.attemptErrors ?? [],
           });
           diagnostics.push({ postId: candidate.postId, beforeTrust, failure: failures.at(-1) });
+          processedCandidates += 1;
+          lastCandidate = { index: i, postId: String(candidate.postId), outcome: 'capture-root-body-failed' };
+          await checkpoint('preparing');
           continue;
         }
         body = capture.body;
@@ -356,6 +452,12 @@ async function prepareReview({ discovery, cli, config, registry, indexPath, runD
           identity: capture.identity,
         }, null);
         stampStrictBody(record, bodyValidation);
+        // A root-body capture is the expensive step. Persist it immediately so
+        // an interruption only ever loses the item currently in flight.
+        await saveCorpusRegistry(indexPath, registry);
+        capturedBodies += 1;
+      } else {
+        trustedBodies += 1;
       }
 
       const prior = priorJudgment(record, config.review.topicKey, config.corpus.acceptedAcceptanceVersions);
@@ -386,10 +488,14 @@ async function prepareReview({ discovery, cli, config, registry, indexPath, runD
       if (prior.judgment) {
         alreadyJudged.push({ ...row, judgment: prior.judgment, judgmentTrust: prior.trust });
         console.log(`[review-v2] ${i + 1}/${discovery.candidates.length} post=${row.postId} prior=${prior.judgment.relevant ? 'YES' : 'NO'} body=${bodySource}`);
+        lastCandidate = { index: i, postId: row.postId, outcome: 'already-judged' };
       } else {
         queue.push(row);
         console.log(`[review-v2] ${i + 1}/${discovery.candidates.length} post=${row.postId} queued bodyChars=${body.length} body=${bodySource} priorTrust=${prior.trust.reason}`);
+        lastCandidate = { index: i, postId: row.postId, outcome: 'queued-for-review' };
       }
+      processedCandidates += 1;
+      await checkpoint('preparing');
     }
   } finally {
     if (browser) await browser.context.close();
@@ -401,6 +507,13 @@ async function prepareReview({ discovery, cli, config, registry, indexPath, runD
     topicKey: config.review.topicKey,
     topicLabel: config.review.topicLabel,
     generatedAt: new Date().toISOString(),
+    preparation: {
+      preflightBatchSize,
+      processedCandidates,
+      deferredCandidates,
+      capturedBodies,
+      trustedBodies,
+    },
     instructions: 'Read the complete verified root-post body. relevant=true only if the MAIN SUBJECT is personal expense management / personal finance management. Otherwise false. Judge meaning, not keywords. Do not infer relevance from search snippets or comments.',
     items: queue,
     alreadyJudged,
@@ -433,8 +546,27 @@ async function prepareReview({ discovery, cli, config, registry, indexPath, runD
     alreadyJudged: alreadyJudged.length,
     bodyCaptureFailures: failures.length,
     bodyAcceptanceVersion: ROOT_BODY_ACCEPTANCE_VERSION,
+    reviewPreparation: {
+      preflightBatchSize,
+      processedCandidates,
+      deferredCandidates,
+      capturedBodies,
+      trustedBodies,
+    },
   });
-  return { reviewQueue, queue, alreadyJudged, failures, diagnostics };
+  await checkpoint('prepared');
+  return {
+    reviewQueue,
+    queue,
+    alreadyJudged,
+    failures,
+    diagnostics,
+    preflightBatchSize,
+    processedCandidates,
+    deferredCandidates,
+    capturedBodies,
+    trustedBodies,
+  };
 }
 
 function validateReviewAndDecisions(review, decisions) {
@@ -685,7 +817,7 @@ async function main() {
   if (!Array.isArray(discovery.candidates)) throw new Error(`Invalid discovery artifact: ${discoveryPath}`);
   const prepared = await prepareReview({ discovery, cli, config, registry, indexPath, runDir });
   await saveCorpusRegistry(indexPath, registry);
-  console.log(`[review-v2] PREPARED queued=${prepared.queue.length} alreadyJudged=${prepared.alreadyJudged.length} bodyFailures=${prepared.failures.length}`);
+  console.log(`[review-v2] PREPARED queued=${prepared.queue.length} alreadyJudged=${prepared.alreadyJudged.length} bodyFailures=${prepared.failures.length} deferred=${prepared.deferredCandidates} captured=${prepared.capturedBodies} cacheHits=${prepared.trustedBodies} batch=${prepared.preflightBatchSize}`);
   console.log(`[review-v2] Queue: ${path.join(runDir, 'review-queue.json')}`);
   console.log(`[review-v2] Decision template: ${path.join(runDir, 'relevance-decisions.template.json')}`);
   if (prepared.failures.length) {

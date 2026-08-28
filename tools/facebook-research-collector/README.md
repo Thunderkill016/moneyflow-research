@@ -140,10 +140,13 @@ review-queue.json
 relevance-decisions.template.json
 body-capture-diagnostics.json
 body-capture-failures.json      # only when capture fails
+review-preparation.json         # durable strict-body progress/checkpoint
 TOPIC_RUN.json
 ```
 
-If any candidate cannot produce a verified root body after bounded retries, `TOPIC_RUN.status` becomes `blocked-body-capture` and the command fails. Do not assess or apply a partial queue as complete evidence.
+Strict root-body preparation is batched. The default queue contains at most 10 new, unreviewed bodies, so an assessor can begin a small safe review without browser-capturing every discovered candidate first. `review-preparation.json` is updated after each candidate and every successful strict body is checkpointed in the corpus registry before the next Facebook navigation. If the process stops, rerun preparation against the same `discovery.json`; already-checkpointed bodies are reused only under the strict body trust contract.
+
+If any candidate in the batch cannot produce a verified root body after bounded retries, `TOPIC_RUN.status` becomes `blocked-body-capture` and the command fails. Do not assess or apply a partial queue as complete evidence.
 
 Relevant review configuration:
 
@@ -152,10 +155,13 @@ Relevant review configuration:
   "review": {
     "topicKey": "personal-expense-management",
     "bodyCaptureRetries": 2,
-    "bodyCaptureRetryDelayMs": 800
+    "bodyCaptureRetryDelayMs": 800,
+    "preflightBatchSize": 10
   }
 }
 ```
+
+Discovery emits terminal progress every `discovery.progressEveryRounds` scroll rounds (10 by default). This is observability only: it does not weaken the recorded completion or truncation semantics.
 
 ## Assess and apply
 
@@ -171,7 +177,7 @@ npm run collect -- \
   --output-dir output/<collection-run>
 ```
 
-`collection.maxPosts` is the default safety budget for deep comment collection. Use an explicit bounded override only when intentionally running a smaller live gate:
+`collection.maxPosts` is the default safety budget for deep comment collection. The same explicit `--limit` also bounds the number of newly prepared review rows, making a one-post live gate bounded through preparation and deep collection (discovery remains complete and reports its own scope):
 
 ```bash
 npm run collect -- \
@@ -181,7 +187,16 @@ npm run collect -- \
   --limit 1
 ```
 
-`--limit` applies after relevance review; it does not suppress root-body preparation for candidates that still require an assessor decision.
+When a review batch has `TOPIC_RUN.reviewPreparation.deferredCandidates > 0`, apply the current decisions, then prepare the next batch from the same immutable discovery artifact:
+
+```bash
+npm run collect -- \
+  --config config.json \
+  --from-discovery output/<discovery-run>/discovery.json \
+  --output-dir output/<next-review-run>
+```
+
+The deep collector still recaptures the strict root after review before comment expansion. That second navigation is intentional: it rejects a decision if the root evidence changed; the collector must not apply a relevance judgment to a different body.
 
 The v0.8 apply gate rejects:
 

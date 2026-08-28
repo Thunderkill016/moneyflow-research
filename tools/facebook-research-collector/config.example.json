@@ -145,6 +145,7 @@
     "stableBottomRounds": 3,
     "bottomTolerancePx": 100,
     "settleMs": 700,
+    "progressEveryRounds": 10,
     "maxCandidatesPerQuery": 500
   },
   "corpus": {
@@ -159,7 +160,8 @@
     "topicKey": "personal-expense-management",
     "topicLabel": "quản lý chi tiêu / tài chính cá nhân",
     "bodyCaptureRetries": 2,
-    "bodyCaptureRetryDelayMs": 800
+    "bodyCaptureRetryDelayMs": 800,
+    "preflightBatchSize": 10
   },
   "collection": {
     "maxPosts": 25,

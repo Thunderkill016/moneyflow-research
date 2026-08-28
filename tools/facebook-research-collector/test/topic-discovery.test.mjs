@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSearchUrl, isCandidateAllowedForTarget, parseDiscoveryCli, resolveDiscoveryTargets, selectCardPost } from '../src/topic-discovery.mjs';
+import { buildSearchUrl, isCandidateAllowedForTarget, parseDiscoveryCli, resolveDiscoveryProgressEveryRounds, resolveDiscoveryTargets, selectCardPost } from '../src/topic-discovery.mjs';
 import { parseCollectCli } from '../src/collect.mjs';
 
 test('topic discovery uses Facebook global Posts search and does not inject a group id', () => {
@@ -95,4 +95,13 @@ test('discovery CLI keeps one-query mode explicit', () => {
   const parsed = parseDiscoveryCli(['discover', '--query', 'quản lý thu chi', '--output-dir', 'out']);
   assert.equal(parsed.query, 'quản lý thu chi');
   assert.equal(parsed.outputDir, 'out');
+});
+
+test('discovery progress cadence is bounded and validates invalid configuration', () => {
+  assert.equal(resolveDiscoveryProgressEveryRounds({}), 10);
+  assert.equal(resolveDiscoveryProgressEveryRounds({ progressEveryRounds: 3 }), 3);
+  assert.throws(
+    () => resolveDiscoveryProgressEveryRounds({ progressEveryRounds: 0 }),
+    /progressEveryRounds must be a positive integer/,
+  );
 });
