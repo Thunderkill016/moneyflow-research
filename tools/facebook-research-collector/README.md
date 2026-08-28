@@ -171,6 +171,18 @@ npm run collect -- \
   --output-dir output/<collection-run>
 ```
 
+`collection.maxPosts` is the default safety budget for deep comment collection. Use an explicit bounded override only when intentionally running a smaller live gate:
+
+```bash
+npm run collect -- \
+  --config config.json \
+  --from-review output/<review-run>/review-queue.json \
+  --decisions output/<review-run>/relevance-decisions.json \
+  --limit 1
+```
+
+`--limit` applies after relevance review; it does not suppress root-body preparation for candidates that still require an assessor decision.
+
 The v0.8 apply gate rejects:
 
 - old review schema;

@@ -75,11 +75,16 @@ test('clean post permalink is preferred over highlighted variants for the same i
   assert.equal(selected.link.href, clean);
 });
 
-test('collect entrypoint preserves assessor review arguments', () => {
-  const parsed = parseCollectCli(['collect', '--config', 'config.json', '--from-review', 'queue.json', '--decisions', 'decisions.json', '--output-dir', 'out']);
+test('collect entrypoint preserves assessor review arguments and explicit deep limit', () => {
+  const parsed = parseCollectCli(['collect', '--config', 'config.json', '--from-review', 'queue.json', '--decisions', 'decisions.json', '--output-dir', 'out', '--limit', '3']);
   assert.equal(parsed.fromReview, 'queue.json');
   assert.equal(parsed.decisions, 'decisions.json');
   assert.equal(parsed.outputDir, 'out');
+  assert.equal(parsed.limit, 3);
+});
+
+test('collect entrypoint rejects invalid explicit limit', () => {
+  assert.throws(() => parseCollectCli(['collect', '--limit', '0']), /Invalid --limit value/);
 });
 
 test('collect entrypoint rejects unknown flags instead of silently ignoring them', () => {

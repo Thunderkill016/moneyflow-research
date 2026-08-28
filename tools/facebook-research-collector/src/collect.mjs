@@ -17,6 +17,7 @@ export function parseCollectCli(rawArgs = process.argv.slice(2)) {
     strict: true,
     options: {
       config: { type: 'string', default: 'config.json' },
+      limit: { type: 'string' },
       query: { type: 'string' },
       'discovery-only': { type: 'boolean', default: false },
       'from-discovery': { type: 'string' },
@@ -30,9 +31,17 @@ export function parseCollectCli(rawArgs = process.argv.slice(2)) {
       'test-sort-switch': { type: 'boolean', default: false },
     },
   });
+  let limit = null;
+  if (values.limit) {
+    limit = Number.parseInt(values.limit, 10);
+    if (!Number.isFinite(limit) || limit <= 0) {
+      throw new Error(`Invalid --limit value: "${values.limit}". Must be a positive integer.`);
+    }
+  }
   return {
     command: positionals[0] ?? 'collect',
     config: values.config ?? 'config.json',
+    limit,
     query: values.query ?? null,
     discoveryOnly: Boolean(values['discovery-only']),
     fromDiscovery: values['from-discovery'] ?? null,
@@ -66,6 +75,7 @@ async function runReviewRunner(args) {
 function delegatedArgs(cli) {
   const args = [cli.command];
   args.push('--config', cli.config);
+  if (cli.limit) args.push('--limit', String(cli.limit));
   if (cli.query) args.push('--query', cli.query);
   if (cli.discoveryOnly) args.push('--discovery-only');
   if (cli.fromDiscovery) args.push('--from-discovery', cli.fromDiscovery);
@@ -109,6 +119,7 @@ async function main() {
 
   const reviewArgs = ['collect', '--config', cli.config, '--from-discovery', path.join(runDir, 'discovery.json'), '--output-dir', runDir];
   if (cli.query) reviewArgs.push('--query', cli.query);
+  if (cli.limit) reviewArgs.push('--limit', String(cli.limit));
   if (cli.corpusIndex) reviewArgs.push('--corpus-index', cli.corpusIndex);
   if (cli.recollectKnown) reviewArgs.push('--recollect-known');
   await runReviewRunner(reviewArgs);

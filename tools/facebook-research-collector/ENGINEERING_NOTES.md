@@ -37,6 +37,7 @@ The v0.7 review queue proved a body before assessment, but the default apply pat
 - a reusable deep record must carry valid root-validation metadata.
 - a cache that changes after review preparation is rejected at REUSE rather than trusting its registry entry;
 - a strict alias transition cannot leave the corpus registry key and child collector key divergent.
+- `--limit` is parsed and forwarded through `collect.mjs` and v2 into the deep child collector; a default configured post budget must not be silently bypassed by an entrypoint parser.
 
 ## 2026-08-28 — v0.7 strict root-body review gate
 

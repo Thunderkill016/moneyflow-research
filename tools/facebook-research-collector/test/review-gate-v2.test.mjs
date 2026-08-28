@@ -305,6 +305,7 @@ test('default collect entrypoint routes a review application through the strict 
     '--from-review', reviewPath,
     '--decisions', decisionsPath,
     '--output-dir', outputDir,
+    '--limit', '1',
   ], { cwd: collectorDir });
 
   const run = JSON.parse(await fs.readFile(path.join(outputDir, 'TOPIC_RUN.json'), 'utf8'));

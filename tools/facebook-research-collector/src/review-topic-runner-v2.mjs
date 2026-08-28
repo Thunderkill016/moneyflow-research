@@ -41,6 +41,7 @@ export function parseReviewCli(rawArgs = process.argv.slice(2)) {
     strict: true,
     options: {
       config: { type: 'string', default: 'config.json' },
+      limit: { type: 'string' },
       query: { type: 'string' },
       'discovery-only': { type: 'boolean', default: false },
       'from-discovery': { type: 'string' },
@@ -54,9 +55,17 @@ export function parseReviewCli(rawArgs = process.argv.slice(2)) {
       'test-sort-switch': { type: 'boolean', default: false },
     },
   });
+  let limit = null;
+  if (values.limit) {
+    limit = Number.parseInt(values.limit, 10);
+    if (!Number.isFinite(limit) || limit <= 0) {
+      throw new Error(`Invalid --limit value: "${values.limit}". Must be a positive integer.`);
+    }
+  }
   return {
     command: positionals[0] ?? 'collect',
     config: values.config ?? 'config.json',
+    limit,
     query: values.query ?? null,
     discoveryOnly: Boolean(values['discovery-only']),
     fromDiscovery: values['from-discovery'] ?? null,
@@ -125,6 +134,7 @@ async function exists(filePath) {
 function legacyArgs(cli, configPath, overrides = {}) {
   const values = { ...cli, ...overrides };
   const args = ['collect', '--config', configPath];
+  if (values.limit) args.push('--limit', String(values.limit));
   if (values.query) args.push('--query', values.query);
   if (values.discoveryOnly) args.push('--discovery-only');
   if (values.fromDiscovery) args.push('--from-discovery', values.fromDiscovery);
@@ -169,6 +179,7 @@ async function runLegacyReview(args) {
 
 function delegatedArgs(cli) {
   const args = [cli.command, '--config', cli.config];
+  if (cli.limit) args.push('--limit', String(cli.limit));
   if (cli.query) args.push('--query', cli.query);
   if (cli.discoveryOnly) args.push('--discovery-only');
   if (cli.fromDiscovery) args.push('--from-discovery', cli.fromDiscovery);
