@@ -127,10 +127,15 @@ async function main() {
   if (cli.fromDiscovery) {
     discoveryPath = await resolveDiscoveryPath(cli.fromDiscovery);
   } else {
-    const discovery = await runTopicDiscovery({ configPath: cli.config, query: cli.query, outputDir: runDir });
+    const discovery = await runTopicDiscovery({
+      configPath: cli.config,
+      query: cli.query,
+      limit: cli.limit,
+      outputDir: runDir,
+    });
     discoveryPath = path.join(runDir, 'discovery.json');
     if (cli.discoveryOnly) {
-      console.log(`[collect] discovery-only scope=${discovery.discovery.discoveryScope} candidates=${discovery.discovery.candidateCount}`);
+      console.log(`[collect] discovery-only scope=${discovery.discovery.discoveryScope} candidates=${discovery.discovery.candidateCount}${discovery.discovery.boundedByLimit ? ' bounded=true' : ''}`);
       console.log(`[collect] output=${runDir}`);
       return;
     }
