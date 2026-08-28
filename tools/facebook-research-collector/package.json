@@ -1,9 +1,9 @@
 {
   "name": "moneyflow-facebook-research-collector",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "private": true,
   "type": "module",
-  "description": "Corpus-first browser-assisted Facebook research collector with strict root-post validation, persistent reuse, offline relevance review, and selective comment collection.",
+  "description": "Corpus-first browser-assisted Facebook research collector with bounded discovery, strict root-post validation, persistent reuse, offline relevance review, and selective comment collection.",
   "engines": {
     "node": ">=20"
   },
