@@ -157,7 +157,9 @@
   },
   "review": {
     "topicKey": "personal-expense-management",
-    "topicLabel": "quản lý chi tiêu / tài chính cá nhân"
+    "topicLabel": "quản lý chi tiêu / tài chính cá nhân",
+    "bodyCaptureRetries": 2,
+    "bodyCaptureRetryDelayMs": 800
   },
   "collection": {
     "maxPosts": 25,
