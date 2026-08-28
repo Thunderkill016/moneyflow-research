@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { hashText } from '../src/corpus.mjs';
 import {
   ROOT_BODY_ACCEPTANCE_VERSION,
@@ -61,6 +63,13 @@ test('reviewed body is locally integrity-checked before collection reuse', () =>
     () => reviewedBodyForCollection(tampered),
     (error) => error?.code === 'REVIEWED_BODY_HASH_MISMATCH',
   );
+});
+
+test('review apply carries the verified body into the deep child candidate', async () => {
+  const runnerPath = path.resolve(import.meta.dirname, '../src/review-topic-runner-v2.mjs');
+  const source = await fs.readFile(runnerPath, 'utf8');
+  assert.match(source, /strictBody:\s*\{[\s\S]*?body:\s*row\.body,/);
+  assert.match(source, /fullBodyCaptures:\s*1,/);
 });
 
 test('deep collection proves identity without reading or expanding the root body again', async () => {
