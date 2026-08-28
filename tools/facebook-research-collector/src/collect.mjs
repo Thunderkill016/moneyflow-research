@@ -141,6 +141,7 @@ async function main() {
     return;
   }
 
+  let reviewDiscoveryPath = discoveryPath;
   if (!cli.reviewOnly) {
     const harvest = await harvestBodiesFromDiscovery({
       configPath: cli.config,
@@ -149,6 +150,7 @@ async function main() {
       corpusIndex: cli.corpusIndex,
       limit: cli.limit,
     });
+    reviewDiscoveryPath = harvest.resolvedDiscoveryPath ?? discoveryPath;
     console.log(`[collect] body-harvest status=${harvest.status} scope=${harvest.candidates.length} cacheHits=${harvest.cacheHits} captured=${harvest.captured} failures=${harvest.failures.length}`);
     if (harvest.failures.length) {
       throw new Error(`Body harvest has ${harvest.failures.length} failure(s). Rerun the same discovery artifact; trusted body cache hits will be skipped.`);
@@ -161,7 +163,7 @@ async function main() {
 
   const review = await prepareOfflineReview({
     configPath: cli.config,
-    discoveryPath,
+    discoveryPath: reviewDiscoveryPath,
     outputDir: runDir,
     corpusIndex: cli.corpusIndex,
     limit: cli.limit,
