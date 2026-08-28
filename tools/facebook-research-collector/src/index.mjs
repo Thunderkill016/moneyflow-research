@@ -17,6 +17,12 @@ import {
   scoreRelevance,
   uniqueBy,
 } from './core.mjs';
+import { atomicWriteFile, atomicWriteJson, hashText } from './corpus.mjs';
+import {
+  DEEP_COLLECTION_ACCEPTANCE_VERSION,
+  ROOT_BODY_ACCEPTANCE_VERSION,
+  captureStrictRootBody,
+} from './root-body.mjs';
 
 export function parseCli(rawArgs = process.argv.slice(2)) {
   const { values, positionals } = utilParseArgs({
@@ -796,11 +802,31 @@ async function expandPost(page, postId, config, testSortSwitch = false) {
   };
 }
 
-async function extractPostBundle(page, postId, rawHtmlMaxChars, expansion = null) {
-  return page.evaluate(({ postId, rawHtmlMaxChars, expansion }) => {
+async function extractPostBundle(page, postId, rawHtmlMaxChars, expansion = null, strictCapture = null) {
+  return page.evaluate(({ postId, rawHtmlMaxChars, expansion, strictRootIdentity }) => {
     // 8. Extraction must use the same selected post surface
+    const strictRootMatches = (node) => [...node.querySelectorAll('a[href]')].some((anchor) => {
+      try {
+        const url = new URL(anchor.href, location.origin);
+        if (url.searchParams.has('comment_id') || url.searchParams.has('reply_comment_id')) return false;
+        const path = url.pathname.replace(/\/+$/, '');
+        const match = path.match(/^\/groups\/([^/]+)\/(?:posts|permalink)\/(\d+)$/i);
+        return match?.[1]?.toLowerCase() === strictRootIdentity.groupIdentifier.toLowerCase()
+          && match?.[2] === strictRootIdentity.postId;
+      } catch {
+        return false;
+      }
+    });
+    const visibleArticles = [...document.querySelectorAll('[role="article"]')].filter((node) => {
+      return Boolean(node.offsetWidth || node.offsetHeight || node.getClientRects().length);
+    });
+    const matchingStrictRoots = strictRootIdentity ? visibleArticles.filter(strictRootMatches) : [];
+    if (strictRootIdentity && matchingStrictRoots.length !== 1) {
+      throw new Error(`Expected one strict root article, found ${matchingStrictRoots.length}`);
+    }
+    const strictRoot = matchingStrictRoots[0] ?? null;
     const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
-    const matchingDialog = dialogs.find((d) => {
+    const matchingDialog = strictRoot ? strictRoot.closest('[role="dialog"], [aria-modal="true"]') : dialogs.find((d) => {
       if (!d.offsetParent && d.offsetWidth === 0 && d.offsetHeight === 0) return false;
       const text = d.innerText || '';
       return text.includes(postId) || !!d.querySelector(`a[href*="${postId}"]`);
@@ -808,8 +834,9 @@ async function extractPostBundle(page, postId, rawHtmlMaxChars, expansion = null
       return d.querySelectorAll('[role="article"]').length > 0 && (d.offsetHeight > 200 || (d.innerText || '').length > 200);
     }) || null;
 
-    const surface = matchingDialog || document.querySelector('[role="main"]') || document.querySelector('main') || document.body;
-    const surfaceType = matchingDialog ? 'dialog' : (document.querySelector('[role="main"]') || document.querySelector('main') ? 'main' : 'body');
+    const strictMain = strictRoot?.closest('[role="main"], main') || null;
+    const surface = strictRoot ? (matchingDialog || strictMain || document.body) : (matchingDialog || document.querySelector('[role="main"]') || document.querySelector('main') || document.body);
+    const surfaceType = matchingDialog ? 'dialog' : (strictMain || document.querySelector('[role="main"]') || document.querySelector('main') ? 'main' : 'body');
 
     // Scoped article blocks strictly within the detected post surface
     const allArticles = [...surface.querySelectorAll('[role="article"]')];
@@ -940,7 +967,14 @@ async function extractPostBundle(page, postId, rawHtmlMaxChars, expansion = null
     let selectedScore = 0;
     let selectedReasons = [];
 
-    if (surfaceType === 'dialog') {
+    const strictRoots = strictRoot ? [strictRoot] : [];
+
+    if (strictRoots.length === 1) {
+      root = strictRoots[0];
+      rootSelectionType = 'strict-verified-article';
+      selectedScore = 1000;
+      selectedReasons = ['strict-root-body-contract'];
+    } else if (surfaceType === 'dialog') {
       root = surface;
       rootSelectionType = 'dialog';
       selectedScore = 150;
@@ -1015,7 +1049,7 @@ async function extractPostBundle(page, postId, rawHtmlMaxChars, expansion = null
 
     return {
       pageUrl: location.href,
-      rootFoundByPostLink: rootSelectionType === 'dialog' || (scored[0]?.hasCanonicalLink ?? false),
+      rootFoundByPostLink: Boolean(strictRootIdentity) || rootSelectionType === 'dialog' || (scored[0]?.hasCanonicalLink ?? false),
       rootSelection: {
         type: rootSelectionType,
         candidateCount: allArticles.length,
@@ -1037,13 +1071,19 @@ async function extractPostBundle(page, postId, rawHtmlMaxChars, expansion = null
         htmlTruncated: html.length > rawHtmlMaxChars,
       },
     };
-  }, { postId, rawHtmlMaxChars, expansion });
+  }, {
+    postId,
+    rawHtmlMaxChars,
+    expansion,
+    strictRootIdentity: strictCapture?.identity ?? null,
+  });
 }
 
-export const ACCEPTANCE_VERSION = 'v0.3.0-strict';
+export const ACCEPTANCE_VERSION = DEEP_COLLECTION_ACCEPTANCE_VERSION;
+const LEGACY_ACCEPTANCE_VERSION = 'legacy-unverified-deep-collection-v0';
 
-function normalizeBundle(candidate, bundle, config) {
-  const postText = cleanFacebookPostText(bundle.post.rawText, bundle.post.author ?? '') ||
+function normalizeBundle(candidate, bundle, config, strictCapture = null) {
+  const postText = strictCapture?.body || cleanFacebookPostText(bundle.post.rawText, bundle.post.author ?? '') ||
     cleanFacebookPostText(candidate.preview ?? '', bundle.post.author ?? '');
   const comments = [];
   const fingerprints = new Map();
@@ -1071,11 +1111,12 @@ function normalizeBundle(candidate, bundle, config) {
     schemaVersion: 1,
     source: {
       platform: 'facebook',
-      groupId: candidate.groupId,
+      groupId: strictCapture?.identity?.groupIdentifier ?? candidate.groupId,
+      groupIdentifier: strictCapture?.identity?.groupIdentifier ?? candidate.groupIdentifier ?? candidate.groupId,
       groupName: config.group.name ?? null,
       postId: candidate.postId,
-      canonicalUrl: candidate.canonicalUrl,
-      key: candidate.key,
+      canonicalUrl: strictCapture?.identity?.canonicalUrl ?? candidate.canonicalUrl,
+      key: strictCapture?.identity?.key ?? candidate.key,
       discoveryQueries: candidate.queries,
       discoveredUrls: candidate.discoveredUrls,
     },
@@ -1091,7 +1132,10 @@ function normalizeBundle(candidate, bundle, config) {
     },
     comments: uniqueBy(comments, (item) => item.fingerprint),
     extraction: {
-      acceptanceVersion: ACCEPTANCE_VERSION,
+      acceptanceVersion: strictCapture ? ACCEPTANCE_VERSION : LEGACY_ACCEPTANCE_VERSION,
+      bodyAcceptanceVersion: strictCapture?.validation?.acceptanceVersion ?? null,
+      bodyContentHash: strictCapture ? hashText(postText) : null,
+      rootValidation: strictCapture?.validation ?? null,
       rootFoundByPostLink: bundle.rootFoundByPostLink,
       rootSelection: bundle.rootSelection ?? null,
       expansion: bundle.expansion ?? null,
@@ -1138,6 +1182,19 @@ async function fileExists(filePath) {
   }
 }
 
+export function assertReviewedBodyIsCurrent(candidate, capture) {
+  const expected = candidate?.strictBody;
+  if (!expected) return;
+  if (expected.bodyAcceptanceVersion !== ROOT_BODY_ACCEPTANCE_VERSION) {
+    throw new Error(`Candidate ${candidate.postId} has an unsupported reviewed-body acceptance version`);
+  }
+  if (!expected.bodyContentHash || hashText(capture.body) !== expected.bodyContentHash) {
+    const error = new Error(`Verified root body changed after review for post ${candidate.postId}`);
+    error.code = 'REVIEWED_BODY_CHANGED';
+    throw error;
+  }
+}
+
 async function collect(config, options = {}) {
   let runDir = null;
   if (options.outputDir) {
@@ -1163,7 +1220,7 @@ async function collect(config, options = {}) {
 
   /** Persist current run status to RUN.json */
   const writeRunStatus = async (fields) => {
-    await fs.writeFile(runJsonPath, JSON.stringify({
+    await atomicWriteJson(runJsonPath, {
       startedFromConfig: config._configPath,
       startedAt,
       group: config.group,
@@ -1179,7 +1236,7 @@ async function collect(config, options = {}) {
       },
       note: 'Local research evidence. Do not commit raw Facebook dumps or browser profile data.',
       ...fields,
-    }, null, 2));
+    });
   };
 
   await writeRunStatus({ status: 'running', stage: currentStage });
@@ -1223,19 +1280,19 @@ async function collect(config, options = {}) {
       const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars, expansion);
       const normalized = normalizeBundle(candidate, bundle, config);
 
-      await fs.writeFile(path.join(rawDir, `${candidate.postId}.json`), JSON.stringify({
+      await atomicWriteJson(path.join(rawDir, `${candidate.postId}.json`), {
         source: candidate,
         capturedAt: normalized.capturedAt,
         pageUrl: bundle.pageUrl,
         rootSelection: bundle.rootSelection ?? null,
         expansion: bundle.expansion ?? null,
         raw: bundle.raw,
-      }, null, 2));
-      await fs.writeFile(path.join(normalizedDir, `${candidate.postId}.json`), JSON.stringify(normalized, null, 2));
-      await fs.writeFile(path.join(normalizedDir, `${candidate.postId}.md`), toMarkdown(normalized));
+      });
+      await atomicWriteJson(path.join(normalizedDir, `${candidate.postId}.json`), normalized);
+      await atomicWriteFile(path.join(normalizedDir, `${candidate.postId}.md`), toMarkdown(normalized));
       collected.push(normalized);
 
-      await fs.writeFile(path.join(runDir, 'dataset.json'), JSON.stringify(collected, null, 2));
+      await atomicWriteJson(path.join(runDir, 'dataset.json'), collected);
       await writeRunStatus({
         status: 'completed',
         completedAt: new Date().toISOString(),
@@ -1271,14 +1328,14 @@ async function collect(config, options = {}) {
       ranked = [...candidates].sort((a, b) => b.relevance.score - a.relevance.score || b.preview.length - a.preview.length);
       const relevantCount = candidates.filter((c) => c.relevance?.relevant).length;
       console.log(`[from-discovery] Loaded ${candidates.length} candidates (${relevantCount} keyword-matched score >= ${config.relevance.threshold}).`);
-      await fs.writeFile(path.join(runDir, 'discovery.json'), JSON.stringify({
+      await atomicWriteJson(path.join(runDir, 'discovery.json'), {
         group: config.group,
         queries: config.queries,
         candidateCount: candidates.length,
         relevantCount,
         discoveryDiagnostics,
         candidates,
-      }, null, 2));
+      });
     } else {
       currentStage = 'discovery';
       await writeRunStatus({ status: 'running', stage: currentStage });
@@ -1290,14 +1347,14 @@ async function collect(config, options = {}) {
       ranked = [...candidates].sort((a, b) => b.relevance.score - a.relevance.score || b.preview.length - a.preview.length);
       const relevantCount = candidates.filter((c) => c.relevance?.relevant).length;
 
-      await fs.writeFile(path.join(runDir, 'discovery.json'), JSON.stringify({
+      await atomicWriteJson(path.join(runDir, 'discovery.json'), {
         group: config.group,
         queries: config.queries,
         candidateCount: candidates.length,
         relevantCount,
         discoveryDiagnostics,
         candidates: candidates.map((item) => ({ ...item, relevance: item.relevance })),
-      }, null, 2));
+      });
     }
 
     // Mode 2: Discovery Only
@@ -1346,6 +1403,8 @@ async function collect(config, options = {}) {
             existingNorm?.schemaVersion &&
             Array.isArray(existingNorm?.comments) &&
             extraction?.acceptanceVersion === ACCEPTANCE_VERSION &&
+            extraction?.bodyAcceptanceVersion === ROOT_BODY_ACCEPTANCE_VERSION &&
+            extraction?.rootValidation?.rootIdentityVerified === true &&
             exp?.completeness === 'complete' &&
             exp?.commentSort?.verified === true &&
             exp?.failedScrollAssertion === false &&
@@ -1381,21 +1440,35 @@ async function collect(config, options = {}) {
       while (attempt < 2 && !postSuccess) {
         attempt += 1;
         try {
-          await page.goto(candidate.canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+          let strictCapture = null;
+          if (candidate.strictBody) {
+            strictCapture = await captureStrictRootBody(page, candidate, {
+              allowedGroupIdentifiers: candidate.allowedGroupIdentifiers ?? [],
+            });
+            assertReviewedBodyIsCurrent(candidate, strictCapture);
+            candidate.groupId = strictCapture.identity.groupIdentifier;
+            candidate.groupIdentifier = strictCapture.identity.groupIdentifier;
+            candidate.canonicalUrl = strictCapture.identity.canonicalUrl;
+            candidate.key = strictCapture.identity.key;
+            candidate.corpusKey = strictCapture.identity.key;
+          } else {
+            await page.goto(candidate.canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+          }
           const expansion = await expandPost(page, candidate.postId, config, options.testSortSwitch);
-          const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars, expansion);
-          const normalized = normalizeBundle(candidate, bundle, config);
+          const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars, expansion, strictCapture);
+          const normalized = normalizeBundle(candidate, bundle, config, strictCapture);
 
-          await fs.writeFile(path.join(rawDir, `${candidate.postId}.json`), JSON.stringify({
+          await atomicWriteJson(path.join(rawDir, `${candidate.postId}.json`), {
             source: candidate,
             capturedAt: normalized.capturedAt,
             pageUrl: bundle.pageUrl,
             rootSelection: bundle.rootSelection ?? null,
             expansion: bundle.expansion ?? null,
             raw: bundle.raw,
-          }, null, 2));
-          await fs.writeFile(path.join(normalizedDir, `${candidate.postId}.json`), JSON.stringify(normalized, null, 2));
-          await fs.writeFile(path.join(normalizedDir, `${candidate.postId}.md`), toMarkdown(normalized));
+            strictRootValidation: strictCapture?.validation ?? null,
+          });
+          await atomicWriteJson(path.join(normalizedDir, `${candidate.postId}.json`), normalized);
+          await atomicWriteFile(path.join(normalizedDir, `${candidate.postId}.md`), toMarkdown(normalized));
           collected.push(normalized);
 
           const isStrictComplete =
@@ -1424,6 +1497,7 @@ async function collect(config, options = {}) {
 
           outcomeData = {
             postId: candidate.postId,
+            sourceKey: normalized.source.key,
             url: candidate.canonicalUrl,
             author: normalized.post.author ?? 'Unknown',
             commentsCount: normalized.comments.length,
@@ -1475,8 +1549,8 @@ async function collect(config, options = {}) {
       postOutcomes,
     };
 
-    await fs.writeFile(path.join(runDir, 'reconciliation.json'), JSON.stringify(reconciliation, null, 2));
-    await fs.writeFile(path.join(runDir, 'dataset.json'), JSON.stringify(collected, null, 2));
+    await atomicWriteJson(path.join(runDir, 'reconciliation.json'), reconciliation);
+    await atomicWriteJson(path.join(runDir, 'dataset.json'), collected);
 
     console.log(`\n==================================================`);
     console.log(`TOPIC RECONCILIATION: "${reconciliation.topic}"`);
@@ -1544,4 +1618,3 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
     process.exitCode = 1;
   });
 }
-

@@ -5,7 +5,6 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { chromium } from 'playwright';
-import { cleanFacebookPostText } from './core.mjs';
 import {
   atomicWriteJson,
   cacheCompleteRecord,
@@ -14,7 +13,6 @@ import {
   isReusableRecord,
   loadCachedRecord,
   loadCorpusRegistry,
-  parseFacebookPostIdentity,
   recordBodyPreflight,
   reuseRecordForCandidate,
   saveCorpusRegistry,
@@ -23,9 +21,10 @@ import {
 import {
   ROOT_BODY_ACCEPTANCE_VERSION,
   bodyTrust,
+  captureStrictRootBody,
   classificationTrust,
-  selectStrictRootArticle,
   stampStrictBody,
+  strictCompleteRecordTrust,
 } from './root-body.mjs';
 
 const REVIEW_QUEUE_SCHEMA_VERSION = 2;
@@ -84,7 +83,7 @@ async function loadConfig(configArg) {
     corpus: {
       indexPath: './corpus/index.json',
       cacheDir: './corpus/posts',
-      acceptedAcceptanceVersions: ['v0.3.0-strict'],
+      acceptedAcceptanceVersions: ['v0.8-strict-deep-collection-v1'],
       ...parsed.corpus,
     },
     review: {
@@ -99,6 +98,23 @@ async function loadConfig(configArg) {
 
 function resolveFromConfig(config, value) {
   return path.resolve(config._baseDir, value);
+}
+
+function explicitGroupAliasesForCandidate(candidate, config) {
+  const observed = String(candidate?.groupIdentifier ?? candidate?.groupId ?? '').trim();
+  if (!observed) return [];
+  const configuredGroups = [
+    ...(Array.isArray(config.groups) ? config.groups : []),
+    ...(config.group ? [config.group] : []),
+  ];
+  const match = configuredGroups.find((group) => {
+    const aliases = [group?.id, ...(Array.isArray(group?.aliases) ? group.aliases : [])]
+      .filter(Boolean)
+      .map((value) => String(value).trim().toLowerCase());
+    return aliases.includes(observed.toLowerCase());
+  });
+  if (!match) return [observed];
+  return [...new Set([match.id, ...(match.aliases ?? []), observed].filter(Boolean).map(String))];
 }
 
 async function exists(filePath) {
@@ -179,131 +195,11 @@ async function openContext(config) {
   return { context, page };
 }
 
-function cleanTargetLinkSelector(postId) {
-  const id = String(postId).replace(/[^0-9]/g, '');
-  if (!id) throw new Error(`Invalid Facebook post id: ${postId}`);
-  return [
-    `a[href*="/posts/${id}"]:not([href*="comment_id="]):not([href*="reply_comment_id="])`,
-    `a[href*="/permalink/${id}"]:not([href*="comment_id="]):not([href*="reply_comment_id="])`,
-  ].join(', ');
-}
-
-async function snapshotVisibleArticles(page) {
-  return page.locator('[role="article"]:visible').evaluateAll((articles) => articles.map((article) => ({
-    text: (article.innerText || article.textContent || '').replace(/\s+/g, ' ').trim(),
-    ariaLabel: article.getAttribute('aria-label') || '',
-    links: [...article.querySelectorAll('a[href]')].map((a) => ({ href: a.href })),
-  })));
-}
-
-function rootLocatorForIdentity(page, identity) {
-  const group = String(identity?.groupIdentifier ?? '').replace(/["\\]/g, '');
-  const postId = String(identity?.postId ?? '').replace(/[^0-9]/g, '');
-  if (!group || !postId) return null;
-  const anchor = page.locator([
-    `a[href*="/groups/${group}/posts/${postId}"]:not([href*="comment_id="]):not([href*="reply_comment_id="])`,
-    `a[href*="/groups/${group}/permalink/${postId}"]:not([href*="comment_id="]):not([href*="reply_comment_id="])`,
-  ].join(', '));
-  return page.locator('[role="article"]:visible').filter({ has: anchor });
-}
-
-async function expandRootSeeMore(root) {
-  let clicked = 0;
-  for (let round = 0; round < 12; round += 1) {
-    const controls = root
-      .locator('button, [role="button"]')
-      .filter({ hasText: /^(?:\s*xem thêm\s*|\s*see more\s*)$/i });
-    const count = await controls.count();
-    if (count === 0) break;
-    const control = controls.first();
-    if (!(await control.isVisible().catch(() => false))) break;
-    await control.click({ timeout: 4_000 });
-    clicked += 1;
-    await root.page().waitForTimeout(200);
-  }
-  return clicked;
-}
-
 async function extractRootBodyOnce(page, candidate, attempt) {
-  const targetUrl = candidate.canonicalUrl ?? candidate.discoveredUrls?.[0];
-  if (!targetUrl) throw new Error(`Post ${candidate.postId} has no target URL`);
-  const targetPostId = String(candidate.postId ?? '');
-  if (!/^\d+$/.test(targetPostId)) throw new Error(`Invalid target post id: ${candidate.postId}`);
-
-  await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-  const cleanLink = page.locator(cleanTargetLinkSelector(targetPostId)).first();
-  await cleanLink.waitFor({ state: 'attached', timeout: 8_000 });
-  await page.waitForTimeout(400);
-
-  const snapshots = await snapshotVisibleArticles(page);
-  const selected = selectStrictRootArticle(snapshots, targetPostId);
-  if (!selected.ok) {
-    const error = new Error(`Strict root-body selection failed for ${targetPostId}: ${selected.reason}`);
-    error.code = 'ROOT_BODY_SELECTION_FAILED';
-    error.selection = selected;
-    throw error;
-  }
-
-  const rootIdentity = selected.selection.identity;
-  const roots = rootLocatorForIdentity(page, rootIdentity);
-  if (!roots) throw new Error(`Cannot construct strict root locator for post ${targetPostId}`);
-  const rootCount = await roots.count();
-  if (rootCount !== 1) {
-    const error = new Error(`Expected exactly one strict root article for ${targetPostId}, found ${rootCount}`);
-    error.code = 'ROOT_BODY_AMBIGUOUS_LIVE';
-    error.rootCount = rootCount;
-    error.selection = selected;
-    throw error;
-  }
-
-  const root = roots.first();
-  await root.waitFor({ state: 'visible', timeout: 5_000 });
-  const clickedSeeMore = await expandRootSeeMore(root);
-  const rawBody = await root.innerText();
-  const body = cleanFacebookPostText(rawBody, '');
-  if (!body.trim()) {
-    const error = new Error(`Strict root article for ${targetPostId} produced an empty body`);
-    error.code = 'ROOT_BODY_EMPTY';
-    throw error;
-  }
-
-  const finalPageUrl = page.url();
-  const finalIdentity = parseFacebookPostIdentity(finalPageUrl);
-  if (finalIdentity?.postId && finalIdentity.postId !== targetPostId) {
-    const error = new Error(`Final page identity changed post id ${targetPostId} -> ${finalIdentity.postId}`);
-    error.code = 'ROOT_BODY_FINAL_IDENTITY_MISMATCH';
-    throw error;
-  }
-  if (rootIdentity.postId !== targetPostId) {
-    throw new Error(`Root identity mismatch ${rootIdentity.postId} != ${targetPostId}`);
-  }
-
-  const targetIdentity = parseFacebookPostIdentity(targetUrl);
-  const validation = {
-    acceptanceVersion: ROOT_BODY_ACCEPTANCE_VERSION,
-    rootIdentityVerified: true,
-    targetPostId,
-    targetGroupIdentifier: candidate.groupId ?? candidate.groupIdentifier ?? targetIdentity?.groupIdentifier ?? null,
-    rootPostId: rootIdentity.postId,
-    rootGroupIdentifier: rootIdentity.groupIdentifier ?? null,
-    finalPostId: finalIdentity?.postId ?? targetPostId,
-    finalGroupIdentifier: finalIdentity?.groupIdentifier ?? rootIdentity.groupIdentifier ?? null,
-    rootCleanHref: selected.selection.cleanHref,
-    eligibleRootArticles: selected.eligibleCount,
-    clickedSeeMore,
+  return captureStrictRootBody(page, candidate, {
     attempt,
-    bodyChars: body.length,
-    capturedAt: new Date().toISOString(),
-  };
-
-  return {
-    body,
-    finalPageUrl,
-    identity: rootIdentity,
-    capturedAt: validation.capturedAt,
-    validation,
-    selectionDiagnostics: selected.diagnostics,
-  };
+    allowedGroupIdentifiers: candidate.allowedGroupIdentifiers ?? [],
+  });
 }
 
 async function extractRootBodyWithRetries(page, candidate, config) {
@@ -338,6 +234,10 @@ async function loadTrustedBody(indexPath, record, acceptedVersions) {
   if (trust.kind === 'complete-record') {
     const cached = await loadCachedRecord(indexPath, record);
     if (!cached) throw new Error(`Accepted complete corpus cache missing for ${record.sourceKey}`);
+    const completeTrust = strictCompleteRecordTrust(cached, record?.source?.postId, record?.source?.groupIdentifier);
+    if (!completeTrust.trusted) {
+      throw new Error(`Accepted complete corpus cache is not strict evidence for ${record.sourceKey}: ${completeTrust.reason}`);
+    }
     const body = cached?.post?.text ?? '';
     if (!body.trim()) throw new Error(`Accepted complete corpus cache has empty post body for ${record.sourceKey}`);
     return {
@@ -389,6 +289,7 @@ async function prepareReview({ discovery, cli, config, registry, indexPath, runD
   try {
     for (let i = 0; i < discovery.candidates.length; i += 1) {
       const candidate = structuredClone(discovery.candidates[i]);
+      candidate.allowedGroupIdentifiers = explicitGroupAliasesForCandidate(candidate, config);
       const queries = [...new Set([...(candidate.queries ?? []), ...(cli.query ? [cli.query] : [])].filter(Boolean))];
       let record = upsertDiscovery(registry, candidate, queries);
       const beforeTrust = bodyTrust(record, config.corpus.acceptedAcceptanceVersions);
@@ -561,15 +462,21 @@ async function applyReview({ review, decisions, cli, config, registry, indexPath
   ];
 
   for (const row of allRows) {
-    const candidate = {
+      const candidate = {
       postId: row.postId,
       key: row.sourceKey,
       corpusKey: row.sourceKey,
       groupId: row.sourceGroupIdentifier,
       groupIdentifier: row.sourceGroupIdentifier,
-      canonicalUrl: row.canonicalUrl,
-      queries: row.queries,
-    };
+        canonicalUrl: row.canonicalUrl,
+        queries: row.queries,
+        allowedGroupIdentifiers: row.bodyValidation?.allowedGroupIdentifiers ?? [row.sourceGroupIdentifier],
+        strictBody: {
+          bodyContentHash: row.bodyContentHash,
+          bodyAcceptanceVersion: row.bodyValidation?.acceptanceVersion ?? null,
+          validation: row.bodyValidation,
+        },
+      };
     const record = findCorpusRecord(registry, candidate) ?? upsertDiscovery(registry, candidate, row.queries);
     assertReviewRowStillCurrent(record, row, config.corpus.acceptedAcceptanceVersions);
     const judgment = {
@@ -646,18 +553,38 @@ async function applyReview({ review, decisions, cli, config, registry, indexPath
       await fs.copyFile(reconciliationPath, path.join(runDir, 'collection-reconciliation.json'));
     }
     const datasetPath = path.join(runDir, 'dataset.json');
-    if (await exists(datasetPath)) newDataset = JSON.parse(await fs.readFile(datasetPath, 'utf8'));
+    if (await exists(datasetPath)) {
+      newDataset = JSON.parse(await fs.readFile(datasetPath, 'utf8'));
+      await atomicWriteJson(path.join(runDir, 'collection-dataset.json'), newDataset);
+    }
   }
 
+  const acceptedNewDataset = [];
   for (const normalizedRecord of newDataset) {
-    const candidate = relevantToCollect.find((item) => String(item.postId) === String(normalizedRecord?.source?.postId));
-    const outcome = legacyReconciliation?.postOutcomes?.find?.((item) => String(item.postId) === String(normalizedRecord?.source?.postId));
+    const sourceKey = normalizedRecord?.source?.key ?? null;
+    const candidate = relevantToCollect.find((item) => item.corpusKey === sourceKey || item.key === sourceKey);
+    const outcome = legacyReconciliation?.postOutcomes?.find?.((item) => item.sourceKey === sourceKey);
     if (outcome?.status && outcome.status !== 'complete') continue;
+    if (!candidate) {
+      throw new Error(`Deep collector returned an unplanned source identity: ${sourceKey ?? normalizedRecord?.source?.postId}`);
+    }
+    const collectionTrust = strictCompleteRecordTrust(
+      normalizedRecord,
+      candidate?.postId,
+      candidate?.groupIdentifier ?? candidate?.groupId,
+    );
+    if (!collectionTrust.trusted) {
+      throw new Error(`Deep collector output is not reusable strict evidence for ${sourceKey ?? normalizedRecord?.source?.postId}: ${collectionTrust.reason}`);
+    }
+    if (normalizedRecord?.extraction?.bodyContentHash !== candidate?.strictBody?.bodyContentHash) {
+      throw new Error(`Deep collector body changed after review for ${sourceKey ?? normalizedRecord?.source?.postId}`);
+    }
     await cacheCompleteRecord({ registry, indexPath, cacheDir, normalizedRecord, candidate });
+    acceptedNewDataset.push(normalizedRecord);
   }
   await saveCorpusRegistry(indexPath, registry);
 
-  const merged = [...reusable.map((item) => item.normalizedRecord), ...newDataset];
+  const merged = [...reusable.map((item) => item.normalizedRecord), ...acceptedNewDataset];
   const seen = new Set();
   const dataset = merged.filter((record) => {
     const key = record?.source?.key ?? `facebook:post:${record?.source?.postId}`;
@@ -679,11 +606,14 @@ async function applyReview({ review, decisions, cli, config, registry, indexPath
     datasetRecords: dataset.length,
     generatedAt: new Date().toISOString(),
   };
+  const runStatus = reconciliation.truncated > 0 || reconciliation.failed > 0
+    ? 'completed-with-incomplete-collection'
+    : 'completed';
   await atomicWriteJson(path.join(runDir, 'review-decisions.applied.json'), { schemaVersion: 2, rows });
   await atomicWriteJson(path.join(runDir, 'dataset.json'), dataset);
   await atomicWriteJson(path.join(runDir, 'reconciliation.json'), reconciliation);
-  await atomicWriteJson(path.join(runDir, 'TOPIC_RUN.json'), { status: 'completed', generatedAt: new Date().toISOString(), reconciliation });
-  return reconciliation;
+  await atomicWriteJson(path.join(runDir, 'TOPIC_RUN.json'), { status: runStatus, generatedAt: new Date().toISOString(), reconciliation });
+  return { ...reconciliation, runStatus };
 }
 
 async function resolveDiscoveryPath(requestedPath) {
@@ -716,7 +646,7 @@ async function main() {
     const review = JSON.parse(await fs.readFile(path.resolve(process.cwd(), cli.fromReview), 'utf8'));
     const decisions = JSON.parse(await fs.readFile(path.resolve(process.cwd(), cli.decisions), 'utf8'));
     const reconciliation = await applyReview({ review, decisions, cli, config, registry, indexPath, cacheDir, runDir });
-    console.log(`[review-v2] COMPLETE relevant=${reconciliation.relevant} irrelevant=${reconciliation.irrelevant} fetched=${reconciliation.fetched} reused=${reconciliation.reused}`);
+    console.log(`[review-v2] ${reconciliation.runStatus.toUpperCase()} relevant=${reconciliation.relevant} irrelevant=${reconciliation.irrelevant} fetched=${reconciliation.fetched} reused=${reconciliation.reused}`);
     return;
   }
 

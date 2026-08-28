@@ -4,7 +4,7 @@ Browser-assisted Facebook research evidence collector for MoneyFlow.
 
 The collector is deliberately **user-driven, local, and fail-closed**. It uses the signed-in browser profile only for content that account is legitimately allowed to view. It does not automate credentials, bypass checkpoints/CAPTCHAs/rate limits/privacy controls, spoof fingerprints, or add stealth behavior.
 
-## v0.7 architecture
+## v0.8 architecture
 
 The default flow separates candidate discovery, verified root-post capture, human/agent semantic assessment, corpus reuse, and expensive comment collection:
 
@@ -24,6 +24,8 @@ Facebook discovery
        -> relevant=true + accepted complete cache => REUSE
        -> relevant=true + not complete => COLLECT comments
   -> deep comment/reply collector
+       -> re-proves the root identity immediately before collection
+       -> refuses persistence if the reviewed root body hash changed
        -> All comments when available
        -> post-surface-scoped interaction/scrolling
        -> bottom-stable convergence + completeness diagnostics
@@ -32,18 +34,19 @@ Facebook discovery
 
 Search keywords are recall-oriented candidate discovery only. They are **not** the final relevance classifier. The collector contains no OpenAI key, no external semantic-classification API, and no local LLM dependency. The assessor is operational: it reads the full verified body and records a binary topic judgment.
 
-## Why v0.7 changed the body gate
+## Why v0.8 re-checks the body gate before persistence
 
 Facebook search/permalink surfaces can expose timestamp links carrying `comment_id` or `reply_comment_id`. Those URLs contain the parent post ID even when the visible article is a comment/reply. A loose rule such as “article contains the target post id” can therefore cache comment text as if it were the root post.
 
-v0.7 treats **identity as an acceptance contract**, not a scoring hint:
+v0.8 treats **identity as an acceptance contract**, not a scoring hint:
 
 - a reviewable root article must contain a clean permalink for the exact target post;
 - highlighted comment/reply links alone never establish root identity;
 - a missing or ambiguous root fails closed instead of choosing the “best-looking” article;
 - legacy `status=seen` body caches are considered stale until recaptured through the strict gate;
 - a topic judgment on a seen record is reusable only when it is bound to the exact `bodyContentHash` and body-acceptance version;
-- old accepted strict-complete comment records remain reusable when their acceptance version is explicitly allowed.
+- a deep collection must prove the root again and match the body hash that the assessor reviewed;
+- only `v0.8-strict-deep-collection-v1` records are reusable by the default path; prior `v0.3` records are retained locally but are recaptured rather than silently promoted.
 
 This prevents a bad preflight body or stale judgment from silently becoming permanent corpus truth.
 
@@ -98,7 +101,7 @@ Current example config uses:
 }
 ```
 
-Aliases are explicit because Facebook can navigate a numeric group ID while rendering post URLs with a vanity slug. The canonical evidence keeps the actual group identifier observed on the post URL rather than rewriting it to a configured fallback.
+Aliases are explicit because Facebook can navigate a numeric group ID while rendering post URLs with a vanity slug. They permit only that configured numeric/vanity transition during root validation. The canonical evidence still keeps the actual group identifier observed on the root URL; a post ID alone never causes corpus reuse across groups.
 
 ### Global Posts search
 
@@ -129,7 +132,7 @@ npm run collect -- \
   --output-dir output/<review-run>
 ```
 
-v0.7 writes:
+v0.8 writes:
 
 ```text
 review-queue.json
@@ -167,7 +170,7 @@ npm run collect -- \
   --output-dir output/<collection-run>
 ```
 
-The v0.7 apply gate rejects:
+The v0.8 apply gate rejects:
 
 - old review schema;
 - decisions for another topic;
@@ -192,12 +195,16 @@ Hard reuse boundary: exact Facebook source/post identity. Same-body/near-body fi
 
 Reuse rules:
 
-1. accepted strict-complete record + cache file => body and comments can be reused;
-2. strict v0.7 preflight body => body can be reused for review;
+1. accepted `v0.8-strict-deep-collection-v1` record + cache file => body and comments can be reused;
+2. strict v0.8 preflight body => body can be reused for review;
 3. legacy seen body without strict validation => recapture once before review;
 4. topic judgment on a seen body => reuse only when body hash and body acceptance version still match;
-5. same unique post ID under a known alias can resolve to the existing corpus record;
-6. different post identities remain distinct evidence even when text is identical.
+5. a configured alias can only help prove a root during browser capture; it does not turn an unverified post-id match into corpus reuse;
+6. different group/post identities remain distinct evidence even when text is identical.
+
+Collector JSON artifacts use temp-write, flush, and rename. A crash may leave an unreferenced temporary/cache file, but it cannot make a partial JSON artifact look complete through the corpus index.
+
+When comment expansion is truncated or fails, `collection-dataset.json` retains the diagnostic output, while the final `dataset.json` and corpus contain only strict-complete records. `TOPIC_RUN.json` is then `completed-with-incomplete-collection`, never `completed`.
 
 ## Deep comment completeness
 
@@ -228,7 +235,7 @@ The importer can seed accepted complete records so later topics do not re-fetch 
 npm test
 ```
 
-v0.7 regression coverage includes the previously observed failure class: a comment-highlight-only article carrying the parent post ID must not be accepted as the root post. Tests also cover stale body-cache rejection and binding topic judgments to the body hash/version.
+v0.8 regression coverage includes comment-highlight rejection, cross-group same-post-ID refusal, configured alias-only root validation, stale cache rejection, and the requirement that a reusable deep record carries the strict root validation used for review.
 
 ## Debug paths
 
@@ -238,6 +245,8 @@ The current strict path is the default:
 npm run collect
 npm run collect:review
 ```
+
+Both commands route through discovery plus the v2 review gate when no prepared artifact is supplied. Passing `--from-discovery` or `--from-review --decisions` preserves the same strict gate.
 
 Older paths remain available only for diagnosis/comparison:
 

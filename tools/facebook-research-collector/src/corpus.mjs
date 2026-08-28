@@ -122,10 +122,26 @@ export async function loadCorpusRegistry(indexPath) {
 }
 
 export async function atomicWriteJson(filePath, value) {
+  return atomicWriteFile(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+export async function atomicWriteFile(filePath, content) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-  await fs.writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  await fs.rename(tempPath, filePath);
+  let handle;
+  try {
+    handle = await fs.open(tempPath, 'wx');
+    await handle.writeFile(content, 'utf8');
+    await handle.sync();
+  } finally {
+    await handle?.close();
+  }
+  try {
+    await fs.rename(tempPath, filePath);
+  } catch (error) {
+    await fs.unlink(tempPath).catch(() => {});
+    throw error;
+  }
 }
 
 export async function saveCorpusRegistry(indexPath, registry) {
@@ -143,10 +159,11 @@ export function findCorpusRecord(registry, candidate) {
   for (const key of directKeys) {
     if (registry.posts[key]) return registry.posts[key];
   }
-  const postId = candidate.postId ?? candidate.source?.postId;
-  if (!postId) return null;
-  const matches = Object.values(registry.posts).filter((record) => record?.source?.postId === postId);
-  return matches.length === 1 ? matches[0] : null;
+  // A post id alone is not a reusable source identity. Treating a unique local
+  // match as an alias can silently merge provenance from a different group.
+  // Configured aliases may authorize browser validation, but the final observed
+  // group-plus-post key remains the corpus reuse boundary.
+  return null;
 }
 
 export function isReusableRecord(record, acceptedAcceptanceVersions = []) {
@@ -254,6 +271,8 @@ export async function cacheCompleteRecord({ registry, indexPath, cacheDir, norma
   record.body.contentHash = hashText(bodyText);
   record.body.simHash64 = simHash64(bodyText);
   record.body.text = bodyText;
+  record.body.acceptanceVersion = normalizedRecord?.extraction?.bodyAcceptanceVersion ?? null;
+  record.body.validation = normalizedRecord?.extraction?.rootValidation ?? null;
   return record;
 }
 

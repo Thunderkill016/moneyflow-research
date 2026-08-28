@@ -1,6 +1,8 @@
+import { cleanFacebookPostText } from './core.mjs';
 import { parseFacebookPostIdentity } from './corpus.mjs';
 
-export const ROOT_BODY_ACCEPTANCE_VERSION = 'v0.7-strict-root-body-v2';
+export const ROOT_BODY_ACCEPTANCE_VERSION = 'v0.8-strict-root-body-v3';
+export const DEEP_COLLECTION_ACCEPTANCE_VERSION = 'v0.8-strict-deep-collection-v1';
 
 function normalizeWhitespace(value = '') {
   return String(value).replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
@@ -14,13 +16,18 @@ function normalizedGroupIdentifier(value) {
   return value == null ? null : String(value).trim().toLowerCase();
 }
 
-export function classifyPostHref(href, targetPostId, targetGroupIdentifier = null) {
+function normalizedGroupIdentifiers(value) {
+  const values = value == null ? [] : (Array.isArray(value) ? value : [value]);
+  return new Set(values.map(normalizedGroupIdentifier).filter(Boolean));
+}
+
+export function classifyPostHref(href, targetPostId, targetGroupIdentifiers = null) {
   if (!href) return null;
   const identity = parseFacebookPostIdentity(href);
   if (!identity?.postId || identity.postId !== normalizedPostId(targetPostId)) return null;
-  const expectedGroup = normalizedGroupIdentifier(targetGroupIdentifier);
+  const expectedGroups = normalizedGroupIdentifiers(targetGroupIdentifiers);
   const actualGroup = normalizedGroupIdentifier(identity.groupIdentifier);
-  if (expectedGroup && actualGroup !== expectedGroup) return null;
+  if (expectedGroups.size > 0 && !expectedGroups.has(actualGroup)) return null;
   let highlightKind = 'clean-post-link';
   try {
     const url = new URL(href, 'https://www.facebook.com');
@@ -37,9 +44,9 @@ export function classifyPostHref(href, targetPostId, targetGroupIdentifier = nul
   };
 }
 
-export function selectStrictRootArticle(snapshots, targetPostId, targetGroupIdentifier = null) {
+export function selectStrictRootArticle(snapshots, targetPostId, targetGroupIdentifiers = null) {
   const target = normalizedPostId(targetPostId);
-  const expectedGroup = normalizedGroupIdentifier(targetGroupIdentifier);
+  const expectedGroups = normalizedGroupIdentifiers(targetGroupIdentifiers);
   const diagnostics = [];
   const eligible = [];
 
@@ -48,13 +55,13 @@ export function selectStrictRootArticle(snapshots, targetPostId, targetGroupIden
     const allTargetPostEvidence = (snapshot.links ?? [])
       .map((link) => classifyPostHref(link?.href, target))
       .filter(Boolean);
-    const evidence = expectedGroup
-      ? allTargetPostEvidence.filter((item) => normalizedGroupIdentifier(item.identity.groupIdentifier) === expectedGroup)
+    const evidence = expectedGroups.size > 0
+      ? allTargetPostEvidence.filter((item) => expectedGroups.has(normalizedGroupIdentifier(item.identity.groupIdentifier)))
       : allTargetPostEvidence;
     const cleanEvidence = evidence.filter((item) => item.clean);
     const highlightedEvidence = evidence.filter((item) => !item.clean);
-    const foreignGroupEvidence = expectedGroup
-      ? allTargetPostEvidence.filter((item) => normalizedGroupIdentifier(item.identity.groupIdentifier) !== expectedGroup)
+    const foreignGroupEvidence = expectedGroups.size > 0
+      ? allTargetPostEvidence.filter((item) => !expectedGroups.has(normalizedGroupIdentifier(item.identity.groupIdentifier)))
       : [];
     const aria = normalizeWhitespace(snapshot.ariaLabel ?? '');
     const text = normalizeWhitespace(snapshot.text ?? '');
@@ -95,7 +102,7 @@ export function selectStrictRootArticle(snapshots, targetPostId, targetGroupIden
   if (eligible.length === 0) {
     return {
       ok: false,
-      reason: expectedGroup ? 'no-clean-target-post-permalink-for-group' : 'no-clean-target-post-permalink',
+      reason: expectedGroups.size > 0 ? 'no-clean-target-post-permalink-for-group' : 'no-clean-target-post-permalink',
       diagnostics,
       eligibleCount: 0,
     };
@@ -129,17 +136,174 @@ export function isStrictBodyValidation(validation, expectedPostId = null, expect
   const rootPostId = normalizedPostId(validation.rootPostId);
   const finalPostId = normalizedPostId(validation.finalPostId);
   if (expectedPostId != null && targetPostId !== normalizedPostId(expectedPostId)) return false;
-  if (rootPostId !== targetPostId) return false;
-  if (finalPostId && finalPostId !== targetPostId) return false;
+  if (!targetPostId || rootPostId !== targetPostId || finalPostId !== targetPostId) return false;
 
   const expectedGroup = normalizedGroupIdentifier(expectedGroupIdentifier);
   const targetGroup = normalizedGroupIdentifier(validation.targetGroupIdentifier);
   const rootGroup = normalizedGroupIdentifier(validation.rootGroupIdentifier);
   const finalGroup = normalizedGroupIdentifier(validation.finalGroupIdentifier);
+  const allowedGroups = normalizedGroupIdentifiers(validation.allowedGroupIdentifiers);
+  if (!targetGroup || !rootGroup || !finalGroup) return false;
   if (expectedGroup && targetGroup !== expectedGroup) return false;
-  if (targetGroup && rootGroup !== targetGroup) return false;
-  if (targetGroup && finalGroup && finalGroup !== targetGroup) return false;
+  if (rootGroup !== targetGroup) return false;
+  if (allowedGroups.size === 0) {
+    return finalGroup === targetGroup;
+  }
+  if (!allowedGroups.has(targetGroup) || !allowedGroups.has(finalGroup)) return false;
   return true;
+}
+
+function cleanTargetLinkSelector(postId) {
+  const id = String(postId).replace(/[^0-9]/g, '');
+  if (!id) throw new Error(`Invalid Facebook post id: ${postId}`);
+  return [
+    `a[href*="/posts/${id}"]:not([href*="comment_id="]):not([href*="reply_comment_id="])`,
+    `a[href*="/permalink/${id}"]:not([href*="comment_id="]):not([href*="reply_comment_id="])`,
+  ].join(', ');
+}
+
+async function snapshotVisibleArticles(page) {
+  return page.locator('[role="article"]:visible').evaluateAll((articles) => articles.map((article) => ({
+    text: (article.innerText || article.textContent || '').replace(/\s+/g, ' ').trim(),
+    ariaLabel: article.getAttribute('aria-label') || '',
+    links: [...article.querySelectorAll('a[href]')].map((a) => ({ href: a.href })),
+  })));
+}
+
+async function expandRootSeeMore(root) {
+  let clicked = 0;
+  for (let round = 0; round < 12; round += 1) {
+    const controls = root.locator('button, [role="button"]').filter({ hasText: /^(?:\s*xem thêm\s*|\s*see more\s*)$/i });
+    const count = await controls.count();
+    if (count === 0) break;
+    const control = controls.first();
+    if (!(await control.isVisible().catch(() => false))) break;
+    await control.click({ timeout: 4_000 });
+    clicked += 1;
+    await root.page().waitForTimeout(200);
+  }
+  return clicked;
+}
+
+/**
+ * Capture one root body under the same explicit identity contract used by
+ * review and deep collection. The caller supplies aliases only when they are
+ * explicitly configured for the scoped group; topic-wide candidates use their
+ * observed source group alone.
+ */
+export async function captureStrictRootBody(page, candidate, {
+  attempt = 1,
+  allowedGroupIdentifiers = [],
+} = {}) {
+  const targetUrl = candidate?.canonicalUrl ?? candidate?.discoveredUrls?.[0];
+  const targetIdentity = parseFacebookPostIdentity(targetUrl);
+  const targetPostId = String(candidate?.postId ?? targetIdentity?.postId ?? '');
+  if (!targetUrl) throw new Error(`Post ${candidate?.postId ?? 'unknown'} has no target URL`);
+  if (!/^\d+$/.test(targetPostId)) throw new Error(`Invalid Facebook post id: ${candidate?.postId}`);
+
+  const allowedGroups = normalizedGroupIdentifiers([
+    candidate?.groupId,
+    candidate?.groupIdentifier,
+    targetIdentity?.groupIdentifier,
+    ...allowedGroupIdentifiers,
+  ]);
+  if (allowedGroups.size === 0) throw new Error(`Post ${targetPostId} has no source group identity`);
+
+  await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+  await page.locator(cleanTargetLinkSelector(targetPostId)).first().waitFor({ state: 'attached', timeout: 8_000 });
+  await page.waitForTimeout(400);
+
+  const snapshots = await snapshotVisibleArticles(page);
+  const selected = selectStrictRootArticle(snapshots, targetPostId, [...allowedGroups]);
+  if (!selected.ok) {
+    const error = new Error(`Strict root-body selection failed for ${targetPostId}: ${selected.reason}`);
+    error.code = 'ROOT_BODY_SELECTION_FAILED';
+    error.selection = selected;
+    throw error;
+  }
+
+  const articles = page.locator('[role="article"]:visible');
+  const articleCount = await articles.count();
+  if (selected.selection.index >= articleCount) {
+    const error = new Error(`Strict root article disappeared for post ${targetPostId}`);
+    error.code = 'ROOT_BODY_DISAPPEARED';
+    error.selection = selected;
+    throw error;
+  }
+  const root = articles.nth(selected.selection.index);
+  await root.waitFor({ state: 'visible', timeout: 5_000 });
+  const clickedSeeMore = await expandRootSeeMore(root);
+  const body = cleanFacebookPostText(await root.innerText(), '');
+  if (!body.trim()) {
+    const error = new Error(`Strict root article for ${targetPostId} produced an empty body`);
+    error.code = 'ROOT_BODY_EMPTY';
+    throw error;
+  }
+
+  const rootIdentity = selected.selection.identity;
+  const finalPageUrl = page.url();
+  const finalIdentity = parseFacebookPostIdentity(finalPageUrl);
+  if (!finalIdentity?.postId || !finalIdentity?.groupIdentifier) {
+    const error = new Error(`Final page identity is not verifiable for post ${targetPostId}`);
+    error.code = 'ROOT_BODY_FINAL_IDENTITY_UNVERIFIABLE';
+    throw error;
+  }
+  if (finalIdentity.postId !== targetPostId || !allowedGroups.has(normalizedGroupIdentifier(finalIdentity.groupIdentifier))) {
+    const error = new Error(`Final page identity changed from the allowed source for post ${targetPostId}`);
+    error.code = 'ROOT_BODY_FINAL_IDENTITY_MISMATCH';
+    throw error;
+  }
+
+  const validation = {
+    acceptanceVersion: ROOT_BODY_ACCEPTANCE_VERSION,
+    rootIdentityVerified: true,
+    targetPostId,
+    // Canonical source identity is always what the root article proves. The
+    // configured aliases only authorize an observed numeric/vanity transition.
+    targetGroupIdentifier: rootIdentity.groupIdentifier,
+    rootPostId: rootIdentity.postId,
+    rootGroupIdentifier: rootIdentity.groupIdentifier,
+    finalPostId: finalIdentity.postId,
+    finalGroupIdentifier: finalIdentity.groupIdentifier,
+    allowedGroupIdentifiers: [...allowedGroups].sort(),
+    rootCleanHref: selected.selection.cleanHref,
+    eligibleRootArticles: selected.eligibleCount,
+    clickedSeeMore,
+    attempt,
+    bodyChars: body.length,
+    capturedAt: new Date().toISOString(),
+  };
+  if (!isStrictBodyValidation(validation, targetPostId, rootIdentity.groupIdentifier)) {
+    throw new Error(`Strict root validation could not be stamped for post ${targetPostId}`);
+  }
+
+  return {
+    body,
+    root,
+    finalPageUrl,
+    identity: rootIdentity,
+    capturedAt: validation.capturedAt,
+    validation,
+    selectionDiagnostics: selected.diagnostics,
+  };
+}
+
+export function strictCompleteRecordTrust(normalizedRecord, expectedPostId = null, expectedGroupIdentifier = null) {
+  const extraction = normalizedRecord?.extraction;
+  if (extraction?.acceptanceVersion !== DEEP_COLLECTION_ACCEPTANCE_VERSION) {
+    return { trusted: false, reason: 'unsupported-deep-collection-acceptance-version' };
+  }
+  if (extraction.bodyAcceptanceVersion !== ROOT_BODY_ACCEPTANCE_VERSION) {
+    return { trusted: false, reason: 'unsupported-root-body-acceptance-version' };
+  }
+  if (!String(normalizedRecord?.post?.text ?? '').trim()) return { trusted: false, reason: 'missing-verified-root-body' };
+  const source = normalizedRecord?.source ?? {};
+  const postId = expectedPostId ?? source.postId;
+  const groupIdentifier = expectedGroupIdentifier ?? source.groupIdentifier ?? source.groupId;
+  if (!isStrictBodyValidation(extraction.rootValidation, postId, groupIdentifier)) {
+    return { trusted: false, reason: 'invalid-root-validation' };
+  }
+  return { trusted: true, reason: DEEP_COLLECTION_ACCEPTANCE_VERSION };
 }
 
 export function bodyTrust(record, acceptedCompleteVersions = []) {
@@ -149,6 +313,7 @@ export function bodyTrust(record, acceptedCompleteVersions = []) {
   if (
     record.status === 'complete'
     && record.cacheFile
+    && record.acceptanceVersion === DEEP_COLLECTION_ACCEPTANCE_VERSION
     && (acceptedCompleteVersions.length === 0 || acceptedCompleteVersions.includes(record.acceptanceVersion))
   ) {
     return {

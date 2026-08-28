@@ -2,6 +2,36 @@
 
 This file records durable engineering decisions for the MoneyFlow research collector so future iterations start from known evidence rather than repeating the same investigation.
 
+## 2026-08-28 — v0.8 strict evidence continuity and crash-safe artifacts
+
+### Trigger
+
+The v0.7 review queue proved a body before assessment, but the default apply path delegated deep collection to the older collector. That collector could reselect a root with weaker rules and persisted `v0.3.0-strict` records. A body could therefore be correct when judged yet differ when comments were collected and cached. The corpus layer also treated a locally unique `postId` as reusable across group identifiers.
+
+### Decision
+
+- one strict root capture contract now serves review and deep collection;
+- deep collection re-proves the root immediately before expanding comments and requires the recaptured body hash to equal the reviewed body hash;
+- `v0.8-strict-deep-collection-v1` is the only default reusable complete-record version; legacy artifacts remain local diagnostics, not reusable evidence;
+- an explicit configured numeric/vanity alias may authorize root validation, but the final observed `group + post` key remains the reuse boundary;
+- a partial deep collection is retained as `collection-dataset.json` for diagnosis, excluded from final `dataset.json`/corpus, and recorded as `completed-with-incomplete-collection`;
+- JSON artifacts use temp write, `FileHandle.sync()`, then rename. An interrupted write cannot become a referenced partial JSON artifact.
+
+### External patterns considered
+
+| Source | Decision | Applicability |
+| --- | --- | --- |
+| Playwright locators/actionability | Adapt | Keep locators live and bounded; a root match must be unique rather than selecting an arbitrary first result. |
+| Crawlee request lifecycle | Adapt concepts | Model deep output as accepted only after all invariants pass; incomplete work stays explicit rather than becoming handled/reusable. No Crawlee dependency is justified for this bounded user-driven collector. |
+| Node.js `fs` promises | Adopt | Serialize artifact writes, flush the temp file, and rename it; do not rely on concurrent `writeFile` calls for shared artifacts. |
+
+### Regression guards
+
+- configured aliases are accepted only when explicitly supplied;
+- a foreign group with the same post ID cannot resolve to a corpus record;
+- a changed body after review throws before persistence;
+- a reusable deep record must carry valid root-validation metadata.
+
 ## 2026-08-28 — v0.7 strict root-body review gate
 
 ### Trigger

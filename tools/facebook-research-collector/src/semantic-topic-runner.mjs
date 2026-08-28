@@ -71,7 +71,7 @@ async function loadConfig(configArg) {
     corpus: {
       indexPath: './corpus/index.json',
       cacheDir: './corpus/posts',
-      acceptedAcceptanceVersions: ['v0.3.0-strict'],
+      acceptedAcceptanceVersions: ['v0.8-strict-deep-collection-v1'],
       ...parsed.corpus,
     },
     semanticClassifier: {

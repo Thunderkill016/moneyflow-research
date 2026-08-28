@@ -27,15 +27,22 @@ test('parses the actual group from a Facebook URL without fallback rewriting', (
   assert.equal(result.key, 'facebook:other-group:2211870376267189');
 });
 
-test('corpus lookup reuses one prior post across a new topic by post id', () => {
+test('corpus lookup reuses one prior post across a new topic only by exact source identity', () => {
   const registry = { schemaVersion: 1, posts: {} };
   const first = upsertDiscovery(registry, { key: 'facebook:group-a:123', postId: '123', queries: ['topic-a'] }, ['topic-a']);
   first.status = 'complete';
   first.cacheFile = 'posts/a.json';
   first.acceptanceVersion = 'v0.3.0-strict';
-  const found = findCorpusRecord(registry, { key: 'facebook:group-alias:123', postId: '123', queries: ['topic-b'] });
+  const found = findCorpusRecord(registry, { key: 'facebook:group-a:123', postId: '123', queries: ['topic-b'] });
   assert.equal(found.sourceKey, 'facebook:group-a:123');
   assert.equal(isReusableRecord(found, ['v0.3.0-strict']), true);
+});
+
+test('corpus lookup refuses to merge the same post id from another group identity', () => {
+  const registry = { schemaVersion: 1, posts: {} };
+  upsertDiscovery(registry, { key: 'facebook:group-a:123', postId: '123' });
+  const found = findCorpusRecord(registry, { key: 'facebook:group-b:123', postId: '123' });
+  assert.equal(found, null);
 });
 
 test('near duplicate is flagged but remains a separate source key', () => {

@@ -1,12 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { hashText } from '../src/corpus.mjs';
+import { assertReviewedBodyIsCurrent } from '../src/index.mjs';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { promisify } from 'node:util';
 import {
+  DEEP_COLLECTION_ACCEPTANCE_VERSION,
   ROOT_BODY_ACCEPTANCE_VERSION,
   bodyTrust,
   classificationTrust,
   selectStrictRootArticle,
   stampStrictBody,
+  strictCompleteRecordTrust,
 } from '../src/root-body.mjs';
 
 const POST_ID = '123456789';
@@ -14,6 +22,7 @@ const GROUP = 'example.group';
 const ROOT = `https://www.facebook.com/groups/${GROUP}/posts/${POST_ID}/`;
 const COMMENT = `${ROOT}?comment_id=999`;
 const REPLY = `${ROOT}?comment_id=999&reply_comment_id=888`;
+const execFileAsync = promisify(execFile);
 
 function strictValidation(overrides = {}) {
   return {
@@ -63,6 +72,15 @@ test('strict root selection chooses clean target permalink over a much longer co
   assert.equal(selected.selection.identity.postId, POST_ID);
   assert.equal(selected.selection.identity.groupIdentifier, GROUP);
   assert.equal(selected.selection.cleanHref, ROOT);
+});
+
+test('strict root selection allows only explicitly configured numeric/vanity aliases', () => {
+  const numericAlias = `https://www.facebook.com/groups/1569314343856132/posts/${POST_ID}/`;
+  const selected = selectStrictRootArticle([
+    { text: 'Verified root through configured alias', ariaLabel: '', links: [{ href: numericAlias }] },
+  ], POST_ID, [GROUP, '1569314343856132']);
+  assert.equal(selected.ok, true);
+  assert.equal(selected.selection.identity.groupIdentifier, '1569314343856132');
 });
 
 test('strict root selection fails closed when only the same post id from another group is present', () => {
@@ -130,7 +148,7 @@ test('classification on a seen record is trusted only when bound to body hash an
   assert.equal(current.trusted, true);
 });
 
-test('accepted complete records preserve legacy topic judgments without forcing body recapture', () => {
+test('legacy complete records cannot become reusable evidence under the strict deep contract', () => {
   const r = record({
     status: 'complete',
     acceptanceVersion: 'v0.3.0-strict',
@@ -138,9 +156,90 @@ test('accepted complete records preserve legacy topic judgments without forcing 
     body: { text: 'accepted complete body', contentHash: hashText('accepted complete body') },
   });
   const bodyState = bodyTrust(r, ['v0.3.0-strict']);
-  assert.equal(bodyState.trusted, true);
-  assert.equal(bodyState.kind, 'complete-record');
+  assert.equal(bodyState.trusted, false);
 
   const judgmentState = classificationTrust(r, { relevant: false }, ['v0.3.0-strict']);
-  assert.equal(judgmentState.trusted, true);
+  assert.equal(judgmentState.trusted, false);
+});
+
+test('strict deep records retain the root validation that makes reuse safe', () => {
+  const normalized = {
+    source: { postId: POST_ID, groupIdentifier: GROUP },
+    post: { text: 'Verified root body' },
+    extraction: {
+      acceptanceVersion: DEEP_COLLECTION_ACCEPTANCE_VERSION,
+      bodyAcceptanceVersion: ROOT_BODY_ACCEPTANCE_VERSION,
+      rootValidation: strictValidation(),
+    },
+  };
+  const trust = strictCompleteRecordTrust(normalized, POST_ID, GROUP);
+  assert.equal(trust.trusted, true);
+
+  normalized.extraction.rootValidation.finalGroupIdentifier = 'unconfigured.group';
+  assert.equal(strictCompleteRecordTrust(normalized, POST_ID, GROUP).trusted, false);
+});
+
+test('deep collection fails instead of persisting a body changed after review', () => {
+  const candidate = {
+    postId: POST_ID,
+    strictBody: {
+      bodyAcceptanceVersion: ROOT_BODY_ACCEPTANCE_VERSION,
+      bodyContentHash: hashText('Reviewed root body'),
+    },
+  };
+  assert.doesNotThrow(() => assertReviewedBodyIsCurrent(candidate, { body: 'Reviewed root body' }));
+  assert.throws(
+    () => assertReviewedBodyIsCurrent(candidate, { body: 'A changed root body' }),
+    /Verified root body changed after review/,
+  );
+});
+
+test('default collect entrypoint routes a review application through the strict v2 gate', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'moneyflow-collector-entrypoint-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const outputDir = path.join(root, 'output');
+  const configPath = path.join(root, 'config.json');
+  const reviewPath = path.join(root, 'review-queue.json');
+  const decisionsPath = path.join(root, 'decisions.json');
+  await fs.writeFile(configPath, JSON.stringify({
+    group: { id: GROUP, name: 'Example group' },
+    collection: { outputDir },
+    corpus: {
+      indexPath: './corpus/index.json',
+      cacheDir: './corpus/posts',
+      acceptedAcceptanceVersions: [DEEP_COLLECTION_ACCEPTANCE_VERSION],
+    },
+    review: { topicKey: 'personal-expense-management', topicLabel: 'PFM' },
+  }));
+  await fs.writeFile(reviewPath, JSON.stringify({
+    schemaVersion: 2,
+    bodyAcceptanceVersion: ROOT_BODY_ACCEPTANCE_VERSION,
+    topicKey: 'personal-expense-management',
+    items: [],
+    alreadyJudged: [],
+  }));
+  await fs.writeFile(decisionsPath, JSON.stringify({
+    schemaVersion: 2,
+    bodyAcceptanceVersion: ROOT_BODY_ACCEPTANCE_VERSION,
+    topicKey: 'personal-expense-management',
+    decisions: [],
+  }));
+
+  const collectorDir = path.resolve(import.meta.dirname, '..');
+  await execFileAsync('npm', [
+    'run', 'collect', '--',
+    '--config', configPath,
+    '--from-review', reviewPath,
+    '--decisions', decisionsPath,
+    '--output-dir', outputDir,
+  ], { cwd: collectorDir });
+
+  const run = JSON.parse(await fs.readFile(path.join(outputDir, 'TOPIC_RUN.json'), 'utf8'));
+  assert.equal(run.status, 'completed');
+  assert.equal(run.reconciliation.bodyAcceptanceVersion, ROOT_BODY_ACCEPTANCE_VERSION);
+});
+
+test('collect:review package command cannot bypass the strict default entrypoint', async () => {
+  const packageJson = JSON.parse(await fs.readFile(path.resolve(import.meta.dirname, '..', 'package.json'), 'utf8'));
+  assert.equal(packageJson.scripts['collect:review'], 'node src/collect.mjs collect');
 });

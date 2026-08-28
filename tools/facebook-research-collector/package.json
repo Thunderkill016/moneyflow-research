@@ -1,6 +1,6 @@
 {
   "name": "moneyflow-facebook-research-collector",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "description": "Browser-assisted Facebook research collector with strict root-post body validation, persistent corpus reuse, and assessor-based relevance review.",
@@ -11,7 +11,7 @@
     "login": "node src/collect.mjs login",
     "collect": "node src/collect.mjs collect",
     "discover": "node src/topic-discovery.mjs discover",
-    "collect:review": "node src/review-topic-runner-v2.mjs collect",
+    "collect:review": "node src/collect.mjs collect",
     "collect:review:legacy": "node src/review-topic-runner.mjs collect",
     "collect:semantic": "node src/semantic-topic-runner.mjs collect",
     "collect:heuristic": "node src/topic-runner.mjs collect",
