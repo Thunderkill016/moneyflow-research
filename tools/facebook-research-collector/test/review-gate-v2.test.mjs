@@ -343,6 +343,7 @@ test('review preparation batches uncached bodies and resumes from strict checkpo
   assert.deepEqual(captures, ['1', '2']);
   assert.equal(first.queue.length, 2);
   assert.equal(first.deferredCandidates, 1);
+  assert.equal(first.captureCandidatesAttempted, 2);
   assert.equal(first.capturedBodies, 2);
   assert.equal(contextsClosed, 1);
   const firstRegistry = await loadCorpusRegistry(indexPath);
@@ -377,6 +378,43 @@ test('review preparation batches uncached bodies and resumes from strict checkpo
   assert.deepEqual(second.queue.map((row) => row.postId), ['3']);
   assert.equal(second.capturedBodies, 1);
   assert.equal(second.deferredCandidates, 0);
+});
+
+test('a failed strict capture consumes the preflight budget and defers the rest', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'moneyflow-review-failure-batch-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const runDir = path.join(root, 'review');
+  const indexPath = path.join(root, 'corpus', 'index.json');
+  await fs.mkdir(runDir, { recursive: true });
+  const attempts = [];
+  const result = await prepareReview({
+    discovery: { candidates: [candidate('1'), candidate('2'), candidate('3')] },
+    cli: { limit: 1, query: 'quản lý chi tiêu' },
+    config: {
+      groups: [{ id: GROUP }],
+      corpus: { acceptedAcceptanceVersions: [DEEP_COLLECTION_ACCEPTANCE_VERSION] },
+      review: { topicKey: 'personal-expense-management', topicLabel: 'PFM', preflightBatchSize: 10 },
+    },
+    registry: emptyRegistry(),
+    indexPath,
+    runDir,
+    openReviewContext: async () => ({ page: {}, context: { close: async () => {} } }),
+    captureRootBodyWithRetries: async (_page, candidateRow) => {
+      attempts.push(candidateRow.postId);
+      const error = new Error('strict root selector did not resolve');
+      error.code = 'ROOT_BODY_RETRIES_EXHAUSTED';
+      throw error;
+    },
+  });
+
+  assert.deepEqual(attempts, ['1']);
+  assert.equal(result.captureCandidatesAttempted, 1);
+  assert.equal(result.failures.length, 1);
+  assert.equal(result.deferredCandidates, 2);
+  const run = JSON.parse(await fs.readFile(path.join(runDir, 'TOPIC_RUN.json'), 'utf8'));
+  assert.equal(run.status, 'blocked-body-capture');
+  assert.equal(run.reviewPreparation.captureCandidatesAttempted, 1);
+  assert.equal(run.reviewPreparation.deferredCandidates, 2);
 });
 
 test('explicit limit bounds a review preflight batch and malformed batch config fails closed', () => {

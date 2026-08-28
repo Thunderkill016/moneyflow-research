@@ -1,6 +1,6 @@
 {
   "name": "moneyflow-facebook-research-collector",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "private": true,
   "type": "module",
   "description": "Browser-assisted Facebook research collector with strict root-post body validation, persistent corpus reuse, and assessor-based relevance review.",

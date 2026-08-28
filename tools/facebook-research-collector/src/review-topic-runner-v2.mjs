@@ -311,6 +311,7 @@ function preparationState({
   discoveryCandidateCount,
   preflightBatchSize,
   processedCandidates,
+  captureCandidatesAttempted,
   capturedBodies,
   trustedBodies,
   queued,
@@ -328,6 +329,7 @@ function preparationState({
     discoveryCandidateCount,
     preflightBatchSize,
     processedCandidates,
+    captureCandidatesAttempted,
     capturedBodies,
     trustedBodies,
     queued,
@@ -359,6 +361,7 @@ export async function prepareReview({
   const startedAt = new Date().toISOString();
   const preflightBatchSize = resolveReviewPreflightBatchSize(cli.limit, config.review);
   let processedCandidates = 0;
+  let captureCandidatesAttempted = 0;
   let capturedBodies = 0;
   let trustedBodies = 0;
   let deferredCandidates = 0;
@@ -372,6 +375,7 @@ export async function prepareReview({
       discoveryCandidateCount: discovery.candidates.length,
       preflightBatchSize,
       processedCandidates,
+      captureCandidatesAttempted,
       capturedBodies,
       trustedBodies,
       queued: queue.length,
@@ -386,7 +390,10 @@ export async function prepareReview({
 
   try {
     for (let i = 0; i < discovery.candidates.length; i += 1) {
-      if (queue.length >= preflightBatchSize) {
+      // A failed capture is still an expensive Facebook navigation. Limit it
+      // just as strictly as a successful one, otherwise a one-post live gate
+      // can turn into a full-run failure storm.
+      if (queue.length >= preflightBatchSize || captureCandidatesAttempted >= preflightBatchSize) {
         deferredCandidates = discovery.candidates.length - i;
         break;
       }
@@ -414,6 +421,9 @@ export async function prepareReview({
 
       if (!loaded.trusted) {
         browser ??= await openReviewContext(config);
+        captureCandidatesAttempted += 1;
+        lastCandidate = { index: i, postId: String(candidate.postId), outcome: 'capture-root-body-in-flight' };
+        await checkpoint('preparing');
         try {
           capture = await captureRootBodyWithRetries(browser.page, candidate, config);
         } catch (error) {
@@ -510,6 +520,7 @@ export async function prepareReview({
     preparation: {
       preflightBatchSize,
       processedCandidates,
+      captureCandidatesAttempted,
       deferredCandidates,
       capturedBodies,
       trustedBodies,
@@ -549,6 +560,7 @@ export async function prepareReview({
     reviewPreparation: {
       preflightBatchSize,
       processedCandidates,
+      captureCandidatesAttempted,
       deferredCandidates,
       capturedBodies,
       trustedBodies,
@@ -563,6 +575,7 @@ export async function prepareReview({
     diagnostics,
     preflightBatchSize,
     processedCandidates,
+    captureCandidatesAttempted,
     deferredCandidates,
     capturedBodies,
     trustedBodies,
@@ -817,7 +830,7 @@ async function main() {
   if (!Array.isArray(discovery.candidates)) throw new Error(`Invalid discovery artifact: ${discoveryPath}`);
   const prepared = await prepareReview({ discovery, cli, config, registry, indexPath, runDir });
   await saveCorpusRegistry(indexPath, registry);
-  console.log(`[review-v2] PREPARED queued=${prepared.queue.length} alreadyJudged=${prepared.alreadyJudged.length} bodyFailures=${prepared.failures.length} deferred=${prepared.deferredCandidates} captured=${prepared.capturedBodies} cacheHits=${prepared.trustedBodies} batch=${prepared.preflightBatchSize}`);
+  console.log(`[review-v2] PREPARED queued=${prepared.queue.length} alreadyJudged=${prepared.alreadyJudged.length} bodyFailures=${prepared.failures.length} deferred=${prepared.deferredCandidates} attempted=${prepared.captureCandidatesAttempted} captured=${prepared.capturedBodies} cacheHits=${prepared.trustedBodies} batch=${prepared.preflightBatchSize}`);
   console.log(`[review-v2] Queue: ${path.join(runDir, 'review-queue.json')}`);
   console.log(`[review-v2] Decision template: ${path.join(runDir, 'relevance-decisions.template.json')}`);
   if (prepared.failures.length) {

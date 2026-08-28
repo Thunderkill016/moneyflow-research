@@ -144,7 +144,7 @@ review-preparation.json         # durable strict-body progress/checkpoint
 TOPIC_RUN.json
 ```
 
-Strict root-body preparation is batched. The default queue contains at most 10 new, unreviewed bodies, so an assessor can begin a small safe review without browser-capturing every discovered candidate first. `review-preparation.json` is updated after each candidate and every successful strict body is checkpointed in the corpus registry before the next Facebook navigation. If the process stops, rerun preparation against the same `discovery.json`; already-checkpointed bodies are reused only under the strict body trust contract.
+Strict root-body preparation is batched. The default batch makes at most 10 browser capture attempts (including failed attempts) and queues at most 10 new, unreviewed bodies, so an assessor can begin a small safe review without browser-capturing every discovered candidate first. `review-preparation.json` is updated after each candidate and every successful strict body is checkpointed in the corpus registry before the next Facebook navigation. If the process stops, rerun preparation against the same `discovery.json`; already-checkpointed bodies are reused only under the strict body trust contract.
 
 If any candidate in the batch cannot produce a verified root body after bounded retries, `TOPIC_RUN.status` becomes `blocked-body-capture` and the command fails. Do not assess or apply a partial queue as complete evidence.
 
