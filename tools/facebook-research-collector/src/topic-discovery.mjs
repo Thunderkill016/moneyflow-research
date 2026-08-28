@@ -15,6 +15,13 @@ function normalizeWhitespace(value = '') {
   return String(value).replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+function parsePositiveLimit(value, label = '--limit') {
+  if (value == null || value === '') return null;
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`Invalid ${label} value: ${JSON.stringify(value)}. Must be a positive integer.`);
+  return parsed;
+}
+
 export function parseDiscoveryCli(rawArgs = process.argv.slice(2)) {
   const { values, positionals } = parseArgs({
     args: rawArgs,
@@ -23,6 +30,7 @@ export function parseDiscoveryCli(rawArgs = process.argv.slice(2)) {
     options: {
       config: { type: 'string', default: 'config.json' },
       query: { type: 'string' },
+      limit: { type: 'string' },
       'output-dir': { type: 'string' },
     },
   });
@@ -30,6 +38,7 @@ export function parseDiscoveryCli(rawArgs = process.argv.slice(2)) {
     command: positionals[0] ?? 'discover',
     config: values.config ?? 'config.json',
     query: values.query ?? null,
+    limit: parsePositiveLimit(values.limit),
     outputDir: values['output-dir'] ?? null,
   };
 }
@@ -54,22 +63,14 @@ export function resolveDiscoveryTargets(parsed, scope) {
       const aliases = Array.isArray(group.aliases)
         ? [...new Set([id, ...group.aliases.map(String)])]
         : [id];
-      return {
-        id,
-        name: group.name ?? id,
-        aliases,
-      };
+      return { id, name: group.name ?? id, aliases };
     });
   if (!targets.length && parsed.group?.id) {
     const id = String(parsed.group.id);
     const aliases = Array.isArray(parsed.group.aliases)
       ? [...new Set([id, ...parsed.group.aliases.map(String)])]
       : [id];
-    targets.push({
-      id,
-      name: parsed.group.name ?? id,
-      aliases,
-    });
+    targets.push({ id, name: parsed.group.name ?? id, aliases });
   }
   if (!targets.length) throw new Error('discovery.scope="group" requires config.groups[] or config.group.id');
   return targets;
@@ -99,6 +100,7 @@ async function loadConfig(configArg, cliQuery = null) {
       stableBottomRounds: 3,
       bottomTolerancePx: 100,
       settleMs: 700,
+      initialReadyMs: 1800,
       maxCandidatesPerQuery: 500,
       ...parsed.discovery,
     },
@@ -123,6 +125,10 @@ export function resolveDiscoveryProgressEveryRounds(discoveryConfig = {}) {
     throw new Error(`discovery.progressEveryRounds must be a positive integer, received ${JSON.stringify(discoveryConfig.progressEveryRounds)}`);
   }
   return configured;
+}
+
+export function hasReachedDiscoveryLimit(candidateCount, limit) {
+  return Number.isInteger(limit) && limit > 0 && candidateCount >= limit;
 }
 
 function permalinkLikelihood(link) {
@@ -185,10 +191,7 @@ export function selectCardPost(card) {
   const ranked = [...byIdentity.values()].sort((a, b) => b.score - a.score);
   if (!ranked.length) return null;
   const best = ranked[0];
-  return {
-    ...best,
-    alternativePostKeys: ranked.slice(1).map((item) => item.identity.key),
-  };
+  return { ...best, alternativePostKeys: ranked.slice(1).map((item) => item.identity.key) };
 }
 
 async function scrollMetrics(page) {
@@ -207,12 +210,25 @@ async function scrollMetrics(page) {
   });
 }
 
-async function discoverQuery(page, config, query, globalCandidates, target) {
+async function waitForInitialResults(page, config) {
+  const timeout = Math.max(250, Number(config.discovery.initialReadyMs ?? 1800));
+  await page.locator('[role="article"]:visible').first().waitFor({ state: 'visible', timeout }).catch(() => {});
+}
+
+async function waitForLazyGrowth(page, previousHeight, config) {
+  const timeout = Math.max(120, Number(config.discovery.settleMs ?? 700));
+  await page.waitForFunction((height) => {
+    const root = document.scrollingElement || document.documentElement;
+    return (root.scrollHeight || document.documentElement.scrollHeight || 0) > height + 20;
+  }, previousHeight, { timeout }).catch(() => {});
+}
+
+async function discoverQuery(page, config, query, globalCandidates, target, totalCandidateLimit = null) {
   const scope = config.discovery.scope;
   const groupId = scope === 'group' ? target?.id ?? null : null;
   const url = buildSearchUrl({ scope, groupId, query });
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-  await page.waitForTimeout(Math.max(250, Number(config.discovery.settleMs ?? 700)));
+  await waitForInitialResults(page, config);
 
   const roundLogs = [];
   let stableBottom = 0;
@@ -274,7 +290,7 @@ async function discoverQuery(page, config, query, globalCandidates, target) {
         existing.discoveredUrls.add(link.href);
         if ((card.preview?.length ?? 0) > (existing.preview?.length ?? 0)) existing.preview = normalizeWhitespace(card.preview);
       }
-      if (queryKeys.size >= cap) break;
+      if (queryKeys.size >= cap || hasReachedDiscoveryLimit(globalCandidates.size, totalCandidateLimit)) break;
     }
 
     const before = await scrollMetrics(page);
@@ -283,25 +299,32 @@ async function discoverQuery(page, config, query, globalCandidates, target) {
     if (atBottomBefore && newThisRound === 0 && heightStable) stableBottom += 1;
     else stableBottom = 0;
 
+    const reachedRunLimit = hasReachedDiscoveryLimit(globalCandidates.size, totalCandidateLimit);
     roundLogs.push({
       round,
       groupId,
       groupName: target?.name ?? null,
       cards: cards.length,
       queryCandidateCount: queryKeys.size,
+      totalCandidateCount: globalCandidates.size,
       newThisRound,
       ambiguousCards,
       ...before,
       atBottom: atBottomBefore,
       stableBottomRounds: stableBottom,
+      reachedRunLimit,
     });
 
     const reachedCandidateCap = queryKeys.size >= cap;
     const reachedStableBottom = stableBottom >= requiredStable;
-    if (round === 1 || round % progressEveryRounds === 0 || reachedCandidateCap || reachedStableBottom) {
-      console.log(`[topic-discovery] group=${groupId ?? 'global'} round=${round}/${maxRounds} candidates=${queryKeys.size} cards=${cards.length} new=${newThisRound} bottomStable=${stableBottom}/${requiredStable}`);
+    if (round === 1 || round % progressEveryRounds === 0 || reachedCandidateCap || reachedStableBottom || reachedRunLimit) {
+      console.log(`[topic-discovery] group=${groupId ?? 'global'} round=${round}/${maxRounds} candidates=${queryKeys.size} total=${globalCandidates.size} new=${newThisRound} bottomStable=${stableBottom}/${requiredStable}${reachedRunLimit ? ' limit=hit' : ''}`);
     }
 
+    if (reachedRunLimit) {
+      completionReason = 'run-limit';
+      break;
+    }
     if (reachedCandidateCap) {
       completionReason = 'candidate-cap';
       break;
@@ -313,7 +336,7 @@ async function discoverQuery(page, config, query, globalCandidates, target) {
 
     previousHeight = before.scrollHeight;
     await page.evaluate((pixels) => window.scrollBy(0, pixels), Number(config.discovery.scrollPixels ?? 1400));
-    await page.waitForTimeout(Math.max(250, Number(config.discovery.settleMs ?? 700)));
+    await waitForLazyGrowth(page, before.scrollHeight, config);
   }
 
   const finalMetrics = await scrollMetrics(page);
@@ -328,14 +351,15 @@ async function discoverQuery(page, config, query, globalCandidates, target) {
     candidateCount: queryKeys.size,
     cardsObserved,
     completionReason,
-    completeness: completionReason === 'bottom-stable' ? 'complete' : (extractionFailed ? 'failed' : 'truncated'),
+    completeness: completionReason === 'bottom-stable' ? 'complete' : (completionReason === 'run-limit' ? 'bounded' : (extractionFailed ? 'failed' : 'truncated')),
     finalMetrics: { ...finalMetrics, atBottom: finalMetrics.remainingPx <= tolerance },
     rounds: roundLogs,
   };
 }
 
-export async function runTopicDiscovery({ configPath = 'config.json', query = null, outputDir = null } = {}) {
+export async function runTopicDiscovery({ configPath = 'config.json', query = null, outputDir = null, limit = null } = {}) {
   const config = await loadConfig(configPath, query);
+  const totalCandidateLimit = parsePositiveLimit(limit, 'discovery limit');
   const runDir = outputDir
     ? path.resolve(process.cwd(), outputDir)
     : path.join(resolveFromConfig(config, config.collection.outputDir), timestampSlug());
@@ -352,9 +376,11 @@ export async function runTopicDiscovery({ configPath = 'config.json', query = nu
   const candidates = new Map();
   const diagnostics = [];
   try {
+    discoveryLoop:
     for (const q of config.queries) {
       for (const target of config.discoveryTargets) {
-        diagnostics.push(await discoverQuery(page, config, q, candidates, target));
+        diagnostics.push(await discoverQuery(page, config, q, candidates, target, totalCandidateLimit));
+        if (hasReachedDiscoveryLimit(candidates.size, totalCandidateLimit)) break discoveryLoop;
       }
     }
   } finally {
@@ -366,6 +392,7 @@ export async function runTopicDiscovery({ configPath = 'config.json', query = nu
     queries: [...candidate.queries],
     discoveredUrls: [...candidate.discoveredUrls],
   }));
+  const boundedByLimit = hasReachedDiscoveryLimit(serialized.length, totalCandidateLimit);
   const discovery = {
     schemaVersion: 2,
     generatedAt: new Date().toISOString(),
@@ -373,17 +400,23 @@ export async function runTopicDiscovery({ configPath = 'config.json', query = nu
     discoverySurface: config.discovery.scope === 'topic' ? 'facebook-global-posts-search' : 'facebook-group-search',
     discoveryTargets: config.discoveryTargets,
     queries: config.queries,
+    requestedCandidateLimit: totalCandidateLimit,
+    boundedByLimit,
     candidateCount: serialized.length,
     relevantCount: null,
     candidates: serialized,
     diagnostics,
   };
   await atomicWriteJson(path.join(runDir, 'discovery.json'), discovery);
+  const anyFailed = diagnostics.some((item) => item.completeness === 'failed');
+  const anyTruncated = diagnostics.some((item) => item.completeness === 'truncated');
   await atomicWriteJson(path.join(runDir, 'DISCOVERY_RUN.json'), {
-    status: diagnostics.every((item) => item.completeness === 'complete') ? 'completed' : (diagnostics.some((item) => item.completeness === 'failed') ? 'failed' : 'truncated'),
+    status: boundedByLimit ? 'bounded-complete' : (diagnostics.every((item) => item.completeness === 'complete') ? 'completed' : (anyFailed ? 'failed' : (anyTruncated ? 'truncated' : 'completed'))),
     generatedAt: new Date().toISOString(),
     discoveryScope: config.discovery.scope,
     discoveryTargets: config.discoveryTargets,
+    requestedCandidateLimit: totalCandidateLimit,
+    boundedByLimit,
     candidateCount: serialized.length,
     diagnostics: diagnostics.map(({ rounds, ...item }) => ({ ...item, roundCount: rounds.length })),
   });
@@ -392,9 +425,9 @@ export async function runTopicDiscovery({ configPath = 'config.json', query = nu
 
 async function main() {
   const cli = parseDiscoveryCli();
-  if (!['discover', 'collect'].includes(cli.command)) throw new Error('Usage: topic-discovery.mjs discover [--config config.json] [--query topic] [--output-dir dir]');
-  const result = await runTopicDiscovery({ configPath: cli.config, query: cli.query, outputDir: cli.outputDir });
-  console.log(`[topic-discovery] scope=${result.discovery.discoveryScope} targets=${result.discovery.discoveryTargets.length} candidates=${result.discovery.candidateCount}`);
+  if (!['discover', 'collect'].includes(cli.command)) throw new Error('Usage: topic-discovery.mjs discover [--config config.json] [--query topic] [--limit n] [--output-dir dir]');
+  const result = await runTopicDiscovery({ configPath: cli.config, query: cli.query, limit: cli.limit, outputDir: cli.outputDir });
+  console.log(`[topic-discovery] scope=${result.discovery.discoveryScope} targets=${result.discovery.discoveryTargets.length} candidates=${result.discovery.candidateCount}${result.discovery.boundedByLimit ? ' bounded=true' : ''}`);
   console.log(`[topic-discovery] output=${result.runDir}`);
 }
 
