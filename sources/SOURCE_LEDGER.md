@@ -22,7 +22,11 @@ For each source record:
 | Source | Type | Use | Limits / refresh |
 |---|---|---|---|
 | https://github.com/actualbudget/actual | primary OSS repository | Import IDs, dedup/reconciliation, rules, transfers, pending/cleared, budgeting | Product/storage architecture differs; verify current docs/license before reuse |
+| https://actualbudget.org/docs/transactions/importing/ | primary product documentation | Current import matching, stable imported IDs, fallback matching, deleted/reimport behavior | Matching thresholds and automatic behavior are Actual-specific; refresh when import docs change |
+| https://actualbudget.org/docs/transactions/merging/ | primary product documentation | Explicit duplicate merge behavior and precedence between synced/file/manual transactions | Do not copy merge semantics into MoneyFlow without a dedicated runtime spec |
 | https://github.com/firefly-iii/firefly-iii | primary OSS repository | Ledger semantics, transfers, recurring, rules, importer, reports | AGPL; accounting-heavy scope; primarily concepts and behavior |
+| https://docs.firefly-iii.org/references/data-importer/duplicate-detection/ | primary product documentation | Identifier-vs-content duplicate detection, source-data hashing and import failure modes | Firefly's importer/runtime split and hashing semantics are not MoneyFlow requirements |
+| https://support.ynab.com/en_us/approving-and-matching-transactions-a-guide-ByYNZaQ1i | primary commercial product documentation | Imported transaction review, matching, rejection/correction and bulk-review patterns | YNAB provider stack and UX do not establish Vietnam provider availability or MoneyFlow requirements |
 | https://github.com/ledger/ledger | primary OSS repository | Mature double-entry/reporting invariants | CLI/accounting model is not a MoneyFlow UX requirement |
 | https://github.com/blnkfinance/blnk | primary OSS repository | Ledger, balances, inflight transactions, reconciliation concepts | Service architecture should not be adopted without demonstrated need |
 | https://github.com/flash-oss/medici | primary OSS repository | Balanced journals, void/reversal patterns | MongoDB architecture does not fit MoneyFlow by default |
@@ -34,6 +38,10 @@ For each source record:
 | https://github.com/OpenBankProject/OBP-API | primary OSS repository | Provider-neutral account/transaction/consent API boundaries | EU/open-banking assumptions do not establish Vietnam availability/economics |
 | https://developer.android.com/reference/android/service/notification/NotificationListenerService | official | Android notification acquisition capability | Recheck with target Android version and distribution policy |
 | https://support.google.com/googleplay/android-developer/answer/10208820 | official | Google Play SMS/Call Log sensitive-permission policy | Policy can change; refresh before native Android scope decisions |
+| https://developer.chrome.com/docs/capabilities/web-apis/web-share-target | official | PWA receipt of user-shared text/files, MIME/extension declarations and multipart POST behavior | Requires installed PWA/user-agent support; incoming data remains untrusted; refresh with platform support changes |
+| https://techcombank.com/content/dam/techcombank/cdb-app/documents/pre-login/2-2-user-guide-techcombank-business-web-20251031.pdf | official bank documentation | Example Vietnam bank transaction CSV export and statement download behavior | Business banking only; does not prove consumer availability or universal schemas; refresh when guide changes |
+| https://www.pvcombank.com.vn/static/2025/T8/HDSD_PVConnect%20Biz_MB_Ver1.8.2025.pdf | official bank documentation | Example Vietnam bank statement export to Excel/PDF | Business banking only; not market coverage evidence |
+| https://github.com/opendatalab/MinerU | primary OSS repository | PDF/image/Office document parsing, OCR/layout/table extraction, local/API deployment patterns | Does not prove MoneyFlow field accuracy, latency, privacy fit or license suitability; benchmark and review exact current license before adoption |
 
 ## Security / privacy references
 
