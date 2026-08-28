@@ -1,206 +1,208 @@
-# What should MoneyFlow build next to reduce transaction-maintenance work without reducing trust?
+# What should MoneyFlow build next to reduce actual retyping without reducing trust?
 
-- **Status:** active
+- **Status:** corrected after implementation-level review
 - **Date:** 2026-08-28
-- **Area:** acquisition
-- **MoneyFlow baseline:** `Thunderkill016/moneyflow@6298e6c52cfff6f3a972cf72cf79022e341ce638`; current master program #432; bounded candidate issue #511
-- **Decision boundary:** sequence the next low-maintenance acquisition/review experiments. This record does not authorize implementation, provider access, automatic posting, AI mutation, or a native-app rewrite.
+- **Area:** acquisition / capture
+- **MoneyFlow baseline:** `Thunderkill016/moneyflow@133fa462d3cd5f90b1f70cccb179547815c2ba2d`; master program #432; #511 selected by PR #521; implementation PR #522 remains draft
+- **Decision boundary:** decide which near-term work most directly attacks the strongest observed user problem. This record does not itself authorize implementation, provider access, automatic posting, AI mutation, or native rewrite.
 
-## 1. Question
+## 1. Correction
 
-Given the current MoneyFlow acquisition foundation and the 2026-08-28 community corpus, which near-term work should come first among:
+The earlier version of this record ranked exception-first Inbox review (#511) ahead of acquisition work because it had excellent architecture fit and low implementation risk. That was the wrong primary decision criterion.
 
-1. exception-first Inbox review;
-2. broader/stronger statement and file ingestion;
-3. OCR/document capture;
-4. direct provider/native acquisition?
+The corpus does not say the main problem is "bulk review is too expensive." Its strongest repeated signal is the burden of remembering, entering, correcting, and maintaining transaction data. #511 can improve review safety, but it does **not** materially reduce the work required to get a transaction into MoneyFlow in the first place.
 
-The decision criterion is not feature novelty. It is whether a bounded slice can reduce **manual interventions per 100 observed transactions** and maintenance time without weakening ledger correctness, source provenance, duplicate handling, correction/recovery, or reconciliation.
+This corrected record therefore starts from the user problem, not from which existing subsystem is easiest to extend.
 
-## 2. Current MoneyFlow baseline
+## 2. Evidence that should control priority
 
-Current MoneyFlow already has a provider-neutral acquisition path with persisted source batches/candidates/provenance, Direct CSV, paste/share capture, deterministic candidate rules, duplicate/possible-transfer detection, explicit Inbox review, idempotency/recovery semantics, and a user-owned ledger. It does not currently ship broad bank/provider sync, native-device acquisition, AI mutation, or trustworthy PDF/OCR ingestion as general product capabilities.
+Current adjudicated PFM evidence:
 
-Issue #511 proposes a bounded exception-first review slice using existing deterministic facts. It explicitly forbids auto-posting and forbids using fallback guesses as proof that a candidate is ready.
+| Signal | Strong comments | Authors | Posts | Interpretation |
+|---|---:|---:|---:|---|
+| Manual entry / quick capture | 42 | 39 | 12 | strongest direct capture-friction theme |
+| Habit / discipline burden | 34 | 32 | 11 | repeated logging itself is hard to sustain |
+| Bank sync / import | 30 | 29 | 12 | strong interest in avoiding retyping from digital sources |
+| Spreadsheet workaround | 28 | 25 | 9 | users retain inspectable low-cost alternatives |
+| Acquisition automation | 15 | 15 | 9 | automation is valuable when it removes trusted maintenance work |
+| Reliability / data integrity | 10 | 10 | 7 | faster capture is not useful if the ledger becomes untrustworthy |
 
-Community evidence in the current research corpus identifies capture/maintenance burden as the strongest recurring product problem, while bank/import interest is also strong. The evidence supports reducing maintenance work; it does not by itself prove which OCR engine, bank provider, or native platform path should be adopted.
+The corpus is tech-community-skewed, so these numbers are not Vietnam-wide prevalence. They are strong enough to rank problems inside the current evidence base, not to claim national market share.
 
-## 3. Why this question matters
+## 3. Current product truth
 
-MoneyFlow has already spent substantial engineering effort establishing source identity, candidate review, idempotency, lifecycle evidence and reconciliation safety. The next mistake would be to add a new acquisition channel faster than the user can safely clear the resulting Inbox, or to add heuristic automation that lowers clicks by increasing hidden financial errors.
+### Manual quick capture is already highly compressed
 
-The near-term sequence should therefore maximize reuse of the existing trust architecture and produce measurable evidence before introducing more expensive acquisition surfaces.
+MoneyFlow's current quick-entry path already contains several optimizations that a fresh roadmap should not pretend are missing:
 
-## 4. Sources reviewed
+- amount-first entry;
+- current date by default;
+- remembered account/category preferences;
+- recent account/category presets;
+- deterministic rule-assisted category selection from note text;
+- `Lưu & thêm tiếp` for repeated entry;
+- PWA manifest shortcuts directly to expense, income, and transfer quick capture.
 
-| Source | Type | What it establishes | What it does not establish |
-|---|---|---|---|
-| Current MoneyFlow code/docs, master #432 and issue #511 | primary project truth | Existing Inbox, candidate/review boundaries, current authorization and program metrics | Does not prove user-market prevalence or future provider availability |
-| Actual Budget official import/merge/rules documentation | primary product documentation | Stable import IDs are preferred; weaker sources need fallback matching; imported/manual copies can reconcile; users need visibility and correction when matching is uncertain | Actual's matching thresholds, storage architecture and automatic rule learning are not MoneyFlow requirements |
-| Firefly III official Data Importer duplicate/reconciliation documentation | primary product documentation | Duplicate checks need explicit semantics; false positives/negatives occur; identifier-based detection is strongest when available; reconciliation is a distinct verification workflow | Firefly's AGPL codebase and accounting-heavy UX are not implementation authority for MoneyFlow |
-| YNAB official import/approval/matching documentation | primary commercial product documentation | Imported transactions remain reviewable; bulk actions exist; matching and rejection/correction stay visible; file import remains a fallback when direct import is unavailable | YNAB's provider stack and commercial UX do not establish Vietnam source coverage |
-| Chrome Web Share Target documentation / W3C share-target specification | official web-platform documentation | Installed PWAs can receive shared text and files through explicit MIME/extension declarations and multipart POST; incoming shared data must be treated as untrusted | Does not guarantee every Android app shares useful transaction payloads or every platform supports identical behavior |
-| Techcombank Business and PVcomBank official user guides | official bank documentation | Vietnamese banking channels can expose transaction/statement exports in CSV/XLSX/PDF depending on product/channel; file-based acquisition is a real source family, not a hypothetical one | Business-channel formats do not prove consumer-channel availability or a universal Vietnam format |
-| MinerU official repository/docs | primary OSS project documentation | MinerU 3.x parses PDF/images/Office files to structured Markdown/JSON, supports scanned documents, tables and multilingual OCR, and can run locally | Does not establish MoneyFlow field-level accuracy on Vietnamese receipts/statements or acceptable latency/cost/privacy in our deployment |
+For a returning user whose defaults are valid, the remaining direct-entry path can already approach **amount → save**. Further form polishing may still help, but current evidence does not show that another quick-form redesign is the highest-leverage next slice.
 
-## 5. Findings
+### File ingestion exists, but real-source compatibility is still shallow
 
-### Facts
+MoneyFlow currently accepts CSV, XLS/XLSX, and PDF uploads, but the implementation is deliberately generic/narrow:
 
-1. **The current bottleneck is not absence of an ingestion architecture.** MoneyFlow already has the source-evidence → candidate → review → ledger path required to test lower-maintenance workflows without opening a second financial truth path.
+- CSV/XLSX share one heuristic parser centered on date, amount/debit/credit, and description;
+- XLS/XLSX reads the first sheet and then reuses the CSV matrix heuristics;
+- generic parsing does not preserve bank transaction/reference identity or account/source metadata as first-class parsed fields;
+- PDF support is a narrow text-layer demo template, not general Vietnamese bank-statement support;
+- scanned/image PDF OCR is explicitly unsupported.
 
-2. **Existing mature PFM products separate identity, matching and review.** Actual prefers stable imported IDs when present, falls back to weaker matching when they are absent, and exposes reconciliation outcomes because heuristic matches are not certain. Firefly III separately documents identifier/content duplicate detection and explicitly documents false-positive/false-negative troubleshooting. YNAB imports/matches transactions but still requires review/approval and provides reject/manual-match paths.
+This means the product has the **pipeline** for batch acquisition but has not yet proven that ordinary consumer bank exports can enter it with low correction burden.
 
-3. **Fuzzy matching can create real correctness failures.** Actual has historical bug reports where different imported IDs were incorrectly collapsed by fuzzy deduplication. This is direct evidence against using semantic/fuzzy similarity as a shortcut to expand MoneyFlow's `ready` set.
+## 4. Current external context
 
-4. **File acquisition is a real Vietnam-compatible source family.** Official Vietnamese bank guides show CSV/XLSX/PDF statement or transaction export capabilities in at least some channels. Formats vary, so provider-neutral parsers and explicit account/source mapping remain appropriate.
+Current official sources support two bounded facts relevant to prioritization:
 
-5. **MoneyFlow can extend acquisition on the existing PWA before committing to native.** Web Share Target supports user-selected file sharing into an installed PWA through declared MIME types/extensions and multipart POST. MoneyFlow already has a Share Target path, so additional bounded file/image experiments can reuse an existing platform seam.
+1. **Vietnamese day-to-day digital payments are heavily mobile-banking/QR mediated.** NAPAS reported that by October 2025 nearly 90 million mobile-banking accounts were using bank apps to scan VietQR, with 3.6 billion VietQR transfers in the first ten months of 2025. This does not tell us MoneyFlow's future user mix, but it makes bank-app transaction history a materially important source family to investigate.
+2. **Consumer-exportable transaction history exists.** Vietcombank's official VCB Digibank guide allows users to search account transaction history and export it to Excel. Other official bank channels also expose statement/file downloads, but formats and consumer/business parity vary and must not be assumed universal.
 
-6. **MinerU is technically credible enough to benchmark, not credible enough to adopt by assertion.** Its current official documentation supports scanned PDF/image parsing, tables, structured output and multilingual OCR. None of those claims establish correct extraction of `amount`, `date`, `merchant`, `account/source`, transfer identity, or duplicate identity for MoneyFlow's Vietnamese documents.
+The right inference is not "support every bank." It is: real user-obtainable bank history is a plausible high-volume acquisition source, and MoneyFlow should measure compatibility before investing in provider/native sync.
 
-### Inferences
+## 5. Split the problem by transaction source
 
-#### A. Exception-first Inbox review should come first
+A single capture strategy is wrong because the source problem differs.
 
-Issue #511 has the best dependency fit because it reduces work using information MoneyFlow already possesses. It requires no new external source, no new provider contract, no OCR model, and no weaker matching semantics.
+### A. Digitally sourced bank / QR transactions
 
-A candidate should be considered `ready` only when deterministic existing evidence is sufficient to build a valid ledger post without fallback guessing. Everything else should remain an explicit exception.
+Primary outcome: **stop retyping transactions that already exist as bank-side digital records.**
 
-This produces the cleanest first measurement of whether **grouping known-safe review** reduces interventions without increasing corrections.
+Best near-term experiment: make MoneyFlow ingest a small set of real consumer statement/export families reliably through the existing source → candidate → review → ledger architecture.
 
-#### B. The next acquisition lane after #511 should be file/statement robustness, not provider sync
+Success must be measured as:
 
-Once review burden is measurable, MoneyFlow should improve the sources users can already obtain themselves: CSV/XLSX/PDF statement exports and shared files. This has several advantages:
+- transactions imported per user acquisition action;
+- exact amount/date preservation;
+- source/account identity coverage;
+- transaction/reference identity preservation when the source provides it;
+- percent of rows requiring manual correction;
+- duplicate/transfer errors;
+- interventions per 100 imported rows;
+- reconciliation/correction burden after import.
 
-- provider-independent;
-- user-controlled acquisition;
-- compatible with the existing source/batch/candidate model;
-- can be tested with fixtures and synthetic/private local samples;
-- creates evidence about actual Vietnam format diversity before negotiating provider integrations.
+### B. Cash / off-system transactions
 
-The product should not assume one universal schema. The experiment should inventory real fields, stable transaction identifiers, amount/date/payee conventions, account metadata, running balances and export quirks per source/version.
+Primary outcome: **keep direct entry near one-field friction.**
 
-#### C. OCR/document capture should be an adapter benchmark after structured-file ingestion is understood
+Current Quick Capture already has most obvious fast-path mechanics. The next manual-entry change should only be selected after a real-use test identifies a remaining repeated bottleneck (for example launch friction, wrong default, category correction, or save latency). Do not redesign the form merely because manual entry is the strongest theme.
 
-OCR can remove retyping when the source is image/PDF-only, but it introduces another uncertainty layer. The correct benchmark is field-level transaction usability, not OCR character accuracy.
+## 6. Re-evaluation of #511
 
-A useful benchmark should measure at least:
+#511 is useful **trust/safety infrastructure**, not the primary capture-reduction feature.
 
-- amount exact-match accuracy;
-- transaction date exact-match accuracy;
-- merchant/payee extraction accuracy;
-- account/source detection accuracy when present;
-- transfer/reference identifier preservation;
-- row completeness for multi-row statements;
-- duplicate/source-identity preservation;
-- review interventions required per 100 extracted rows;
-- latency and resource cost;
-- failure-mode visibility and user correction burden.
+The current pre-#511 Inbox already has one-click `Chọn tất cả` followed by review and confirmation. Therefore a `select Ready → review → confirm` path is not a general reduction from five clicks to three; the raw minimum bulk path was already three activations. #511's actual value is that deterministic Ready classification can keep duplicate/transfer/low-confidence/unresolved exceptions out of grouped posting and reduce row-by-row decision burden.
 
-MinerU, PaddleOCR or another parser should compete behind the same adapter contract. The engine name must not leak into ledger semantics.
+That can matter once batch acquisition is working at scale, but it should not be used as evidence that MoneyFlow has solved manual-entry friction.
 
-#### D. Direct provider/native acquisition remains later
+A separate correctness issue discovered during #511 implementation is still valid: grouped/keyboard approval must never bypass explicit confirmation or admit unsafe exception classes. That safety defect should be fixed even if #511 is no longer treated as the roadmap's main acquisition bet.
 
-Provider/native paths may eventually remove more maintenance, but they add consent, token, policy, source-health, retry, privacy, platform-distribution and operational dependencies. Current MoneyFlow and corpus evidence do not justify skipping the cheaper provider-independent experiments that can validate the same core thesis first.
+## 7. Corrected sequence
 
-### Contrary evidence / tensions
+### P0 — prove real consumer bank-file compatibility
 
-- File import is still user-initiated and may not solve habitual capture for users who never download statements.
-- Exception-first review can reduce clicks only if enough candidates are deterministically ready. If most real imported rows lack explicit account/category evidence, #511 may expose rather than solve the next bottleneck.
-- OCR may be more valuable earlier for users whose banks expose only PDF/image artifacts. Current corpus does not quantify that segment well enough.
-- Techcombank/PVcomBank evidence is not a representative sample of all Vietnamese consumer banking products.
-- YNAB/Actual/Firefly operate in different markets and product models; their patterns support trust principles, not Vietnam prevalence.
+Before adding a provider or OCR engine, inventory and benchmark user-obtainable consumer exports from multiple Vietnamese bank channels.
 
-## 6. Applicability to MoneyFlow
+For each source family capture:
 
-### Applies
+- exact export format and channel;
+- preamble/header/table layout;
+- date and posting/value-date fields;
+- signed amount versus debit/credit columns;
+- description/payee fields;
+- account/source metadata;
+- stable transaction/reference identifier;
+- running balance;
+- pending/posted signal if present;
+- current MoneyFlow parse result and correction burden.
 
-- stable source identity outranks fuzzy similarity;
-- deterministic `ready` classification before grouped approval;
-- explicit review/correction for uncertain matches;
-- file sources should remain provider-neutral adapters;
-- source-specific quirks belong in parser/version provenance, not ledger truth;
-- import/OCR outputs remain candidates until the existing ledger path validates them;
-- file/share acquisition can continue on the PWA while native/provider work stays unselected.
+Use sanitized/synthetic fixtures; raw personal statements stay outside Git.
 
-### Does not apply
+### P1 — implement the smallest fixture-backed compatibility slice
 
-- Actual's automatic rule learning from behavior is outside current MoneyFlow authorization;
-- Firefly's content-hash semantics should not be copied into MoneyFlow runtime without a dedicated spec;
-- YNAB's bank-connection providers do not establish Vietnam availability/economics;
-- business-banking export formats do not prove consumer-banking parity;
-- MinerU benchmark claims on general document datasets do not prove MoneyFlow financial-field accuracy.
+After the inventory exposes concrete failures, implement only the smallest parser/adapter changes that materially increase reliable row acquisition. Candidate changes may include header-row discovery, source-specific normalized field extraction, stable reference preservation, or explicit account/source mapping—but only when the fixture evidence demands them.
 
-## 7. Risk review
+Do not create a universal heuristic by guessing unseen bank formats.
 
-| Risk | Finding |
-|---|---|
-| Financial correctness | Highest risk is false `ready` classification or heuristic merging. Keep readiness deterministic and ledger validation unchanged. |
-| Security | New file parsers must remain bounded, treat uploads as untrusted, and avoid executing embedded content/macros. |
-| Privacy/data ownership | Statement/receipt inputs contain sensitive financial/identity data. Prefer local/private processing where practical; never send samples to third parties without explicit data-flow review. |
-| License/IP | Actual/Firefly are references, not code sources by default. MinerU has a custom license based on Apache 2.0 and requires exact license review before adoption. |
-| Operational complexity | #511 adds minimal operations. OCR/provider paths add model/service/runtime health and resource cost. |
-| Rollback/recovery | #511 should be revertable without data migration. New source adapters must remain replayable/idempotent and preserve raw/source provenance according to current product policy. |
+### P1 — preserve the manual fast path
 
-## 8. Recommendation
+Run a short real-use capture test on cash/off-system entries. Only build another manual-capture slice if observed friction remains after the existing amount-first/default/save-next/PWA-shortcut path.
 
-**Adapt.** Execute the sequence **exception-first review → structured file/statement robustness → OCR/document benchmark → provider/native acquisition only after measured evidence**. #511 is the right next bounded product slice because it exploits existing trusted data and can measure maintenance reduction without adding an uncertain source. After #511, run a Vietnam statement-format experiment against user-obtainable CSV/XLSX/PDF exports. Use the results to define a parser adapter contract and only then benchmark MinerU/PaddleOCR on the document cases that structured parsing cannot cover.
+### P2 — OCR only for source classes structured parsing cannot cover
 
-Do not broaden matching or auto-posting to manufacture a larger `ready` set.
+Benchmark screenshots, transfer receipts, scanned statements, and image PDFs only after the source inventory identifies a real uncovered class. Compare by financial-field accuracy and correction burden, not character OCR accuracy.
 
-## 9. Confidence
+### Later — provider/native acquisition
 
-**High for sequencing #511 before OCR/provider work; Medium for statement/file robustness being the immediate next acquisition lane.**
+Provider/native sync can eventually remove more maintenance, but it adds consent, token, source-health, policy, privacy, retry, distribution, and operational dependencies. Do not pay those costs before provider-neutral file acquisition proves the core thesis.
 
-The first conclusion is supported by current MoneyFlow architecture, corpus signals and convergent review/dedup patterns from three mature PFM products. The second is limited by incomplete consumer-bank format coverage in Vietnam and needs a real-source inventory.
+### Fallback — SMS
 
-## 10. Verification before implementation
+SMS ingestion is legacy/fallback coverage, not a primary acquisition bet. Current bank behavior increasingly exposes app/OTT notifications and bank-app history; this is enough to deprioritize SMS but not enough to make a population-wide SMS usage claim.
 
-### For #511
+## 8. What not to build from this evidence
 
-- prove the readiness classifier never relies on fallback account/category selection;
-- unit-test every exclusion reason;
-- browser-test a mixed batch where only deterministic-ready rows are selected and explicitly approved;
-- measure before/after interaction count on the same representative fixture;
-- verify exceptions remain pending and single-review/reject/duplicate/transfer paths remain intact.
+- no "AI finance app" positioning;
+- no family/shared roadmap promotion from weak evidence;
+- no investment/wealth expansion before the daily ledger loop is proven;
+- no fuzzy matching or fallback account/category guesses to manufacture automation metrics;
+- no OCR engine commitment before a field-level benchmark;
+- no provider integration merely because bank import is a strong theme;
+- no additional quick-capture redesign without measured remaining friction.
 
-### For the following statement/file experiment
+## 9. Decision rule for the next MoneyFlow slice
 
-- collect a small private fixture set from multiple Vietnamese banks/channels with secrets/account numbers sanitized or synthetically replaced;
-- record format, columns, encoding, date/amount conventions, account metadata, transaction/reference IDs and running-balance behavior;
-- distinguish consumer from business exports;
-- define parse success and source-identity coverage before choosing parser implementations;
-- do not commit raw personal statements to Git.
+A candidate feature should not become the current product slice unless it can answer all four questions:
 
-### For OCR
+1. **Which adjudicated user problem does it attack?**
+2. **Which current product behavior proves the gap still exists?**
+3. **What user-level metric should move if the feature works?**
+4. **What evidence would cause us to reject or stop the feature?**
 
-- create a sealed benchmark set covering digital PDFs, scanned PDFs, photographed receipts, transfer screenshots and table-heavy statements;
-- compare MinerU/PaddleOCR/structured extraction using field-level metrics and review burden;
-- document local/remote data flow, model license, resource cost and failure behavior;
-- adopt only if measured benefit exceeds the simpler parser path.
+For the immediate next acquisition work, the target problem is manual retyping of already-digital bank transactions; the current gap is shallow real-source statement compatibility; the metric is trusted rows acquired per user action plus correction burden; the invalidation condition is that real consumer exports are inaccessible, too inconsistent, or require so much cleanup that they do not beat direct capture.
 
-## 11. Invalidation / refresh triggers
+## 10. Recommendation
 
-Re-review when:
+**Correct the roadmap.** Treat #511/#522 as review-safety work, not as the main answer to capture friction. The next product-selection decision should be gated by a real Vietnamese consumer statement-format inventory and should prefer the smallest fixture-backed import compatibility slice that reduces actual retyping.
 
-- #511 produces real interaction/correction measurements;
-- MoneyFlow's Inbox/candidate model materially changes;
-- a representative Vietnam bank-source inventory is completed;
-- a bank/provider offers a materially different official consumer export/API path;
-- MinerU/PaddleOCR licensing, architecture or benchmark behavior changes;
-- product evidence shows users do not value a combined/reconciled ledger despite reduced maintenance.
+For cash/off-system transactions, keep the current fast manual path until real-use evidence demonstrates another repeated bottleneck.
 
-## 12. Open questions
+## 11. Confidence and limitations
 
-1. What percentage of real MoneyFlow import candidates can satisfy deterministic `ready` criteria without new inference?
-2. Which Vietnamese consumer banks expose CSV/XLSX versus only PDF, and which include stable transaction/reference IDs?
-3. How often do statement rows represent pending versus posted transactions, and can those states be identified reliably from files?
-4. What private fixture policy lets the project benchmark financial documents without retaining user PII?
-5. Does OCR reduce total review interventions once extraction errors are included, rather than only reducing keystrokes?
+- **High** that the previous claim equating #511 with manual-entry reduction was wrong; current code and existing `Chọn tất cả` behavior make that directly observable.
+- **High inside the corpus** that capture/maintenance burden is the strongest recurring problem family.
+- **Medium** that consumer statement/file compatibility is the highest-leverage next acquisition lane; official export evidence exists, but actual cross-bank format coverage and user willingness to export files remain insufficiently measured.
+- **Low/unknown** for national prevalence, pricing, retention lift, and the proportion of users who will routinely export statements.
 
-## 13. Links back to MoneyFlow
+## 12. Verification before implementation
 
-- Issue/spec/packet: `Thunderkill016/moneyflow#511`, master program `#432`
-- PR/implementation: none yet
-- Related research: `docs/product/2026-08-28-community-corpus-decision-intelligence.md`; `docs/engineering/2026-08-28-research-corpus-ingestion-and-dedup.md`; `decisions/2026-08-28-project-intelligence-corpus-policy.md`
+1. Complete the privacy-safe source-format matrix in research issue #5.
+2. Test current MoneyFlow parsing against synthetic fixtures preserving observed bank structures.
+3. Record failures by field, not by generic "parse failed" labels.
+4. Select one bounded adapter/parser slice only after the failure distribution is known.
+5. For the manual lane, run a real-use capture session before modifying Quick Capture again.
+6. Keep import output as candidates until explicit ledger validation/review; source evidence never establishes `reconciled`.
+
+## 13. Refresh triggers
+
+Refresh this decision when:
+
+- real consumer bank export fixtures are inventoried;
+- current parser performance is measured against those fixtures;
+- a seven-day phone-use test produces actual capture friction data;
+- a provider offers a materially different official read-only path;
+- new non-tech Vietnamese user evidence materially changes the capture ranking.
+
+## 14. Links
+
+- Corpus decision intelligence: `docs/product/2026-08-28-community-corpus-decision-intelligence.md`
+- Source-format experiment: research issue #5
+- MoneyFlow master: `Thunderkill016/moneyflow#432`
+- Current review-safety slice: `Thunderkill016/moneyflow#511`
+- Current draft implementation: `Thunderkill016/moneyflow#522`
