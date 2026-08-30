@@ -1,0 +1,74 @@
+{
+  "groups": [
+    {
+      "id": "1569314343856132",
+      "name": "Build in Public VN",
+      "aliases": [
+        "1569314343856132",
+        "indiehackervn"
+      ]
+    }
+  ],
+  "group": {
+    "id": "1569314343856132",
+    "name": "Build in Public VN",
+    "aliases": [
+      "1569314343856132",
+      "indiehackervn"
+    ],
+    "note": "Backward-compatible single-group fallback."
+  },
+  "queryPlan": {
+    "version": "pfm-corpus-v2",
+    "strategy": "build-in-public-corpus-first-offline-review",
+    "rationale": "Use a small broad query set to surface the reusable corpus once. Prior narrow-query pilots had high review cost and zero marginal relevant yield."
+  },
+  "queries": [
+    "quản lý chi tiêu",
+    "quản lý thu chi",
+    "app quản lý chi tiêu",
+    "sổ thu chi",
+    "app tài chính cá nhân"
+  ],
+  "browser": {
+    "headless": false,
+    "profileDir": "./profile",
+    "locale": "vi-VN"
+  },
+  "discovery": {
+    "scope": "group",
+    "safetyCapRounds": 120,
+    "scrollPixels": 1800,
+    "stableBottomRounds": 3,
+    "bottomTolerancePx": 100,
+    "settleMs": 450,
+    "progressEveryRounds": 10,
+    "maxCandidatesPerQuery": 500
+  },
+  "corpus": {
+    "indexPath": "./corpus/index.json",
+    "cacheDir": "./corpus/posts",
+    "acceptedAcceptanceVersions": [
+      "v0.8-strict-deep-collection-v2"
+    ],
+    "nearDuplicateMaxHamming": 4
+  },
+  "review": {
+    "topicKey": "personal-expense-management",
+    "topicLabel": "quản lý chi tiêu / tài chính cá nhân",
+    "bodyCaptureRetries": 2,
+    "bodyCaptureRetryDelayMs": 800,
+    "preflightBatchSize": 10,
+    "note": "preflightBatchSize is retained for the legacy review-preflight path. v0.9 default prepares review offline after body harvest."
+  },
+  "harvest": {
+    "checkpointEvery": 10
+  },
+  "collection": {
+    "maxPosts": 25,
+    "expandRounds": 40,
+    "maxClicksPerRound": 30,
+    "outputDir": "./output",
+    "rawHtmlMaxChars": 1500000
+  }
+}

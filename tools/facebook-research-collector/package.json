@@ -1,0 +1,27 @@
+{
+  "name": "moneyflow-facebook-research-collector",
+  "version": "0.9.1",
+  "private": true,
+  "type": "module",
+  "description": "Corpus-first browser-assisted Facebook research collector with bounded discovery, strict root-post validation, persistent reuse, offline relevance review, and selective comment collection.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "login": "node src/collect.mjs login",
+    "collect": "node src/collect.mjs collect",
+    "discover": "node src/topic-discovery.mjs discover",
+    "harvest:bodies": "node src/body-harvester.mjs harvest",
+    "review:prepare": "node src/offline-review.mjs prepare",
+    "collect:review": "node src/collect.mjs collect",
+    "collect:review:legacy": "node src/review-topic-runner.mjs collect",
+    "collect:semantic": "node src/semantic-topic-runner.mjs collect",
+    "collect:heuristic": "node src/topic-runner.mjs collect",
+    "collect:legacy": "node src/index.mjs collect",
+    "corpus:import": "node src/import-run.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "playwright": "1.62.1"
+  }
+}

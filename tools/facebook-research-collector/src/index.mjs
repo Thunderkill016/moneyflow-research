@@ -1,0 +1,1606 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import process from 'node:process';
+import readline from 'node:readline/promises';
+import { fileURLToPath } from 'node:url';
+import { parseArgs as utilParseArgs } from 'node:util';
+import { chromium } from 'playwright';
+import {
+  EXPAND_REGEXES,
+  canonicalizeFacebookPostUrl,
+  cleanFacebookPostText,
+  cleanFacebookText,
+  fingerprintComment,
+  isExpandButtonText,
+  isSuspiciousUnmatchedButton,
+  normalizeWhitespace,
+  scoreRelevance,
+  uniqueBy,
+} from './core.mjs';
+import { atomicWriteFile, atomicWriteJson, hashText } from './corpus.mjs';
+import {
+  DEEP_COLLECTION_ACCEPTANCE_VERSION,
+  ROOT_BODY_ACCEPTANCE_VERSION,
+  captureStrictRootBody,
+  resolveStrictRootSurface,
+} from './root-body.mjs';
+
+export function parseCli(rawArgs = process.argv.slice(2)) {
+  const { values, positionals } = utilParseArgs({
+    args: rawArgs,
+    allowPositionals: true,
+    strict: true,
+    options: {
+      config: { type: 'string', default: 'config.json' },
+      limit: { type: 'string' },
+      query: { type: 'string' },
+      'discovery-only': { type: 'boolean', default: false },
+      'post-url': { type: 'string' },
+      'post-id': { type: 'string' },
+      'test-sort-switch': { type: 'boolean', default: false },
+      'from-discovery': { type: 'string' },
+      resume: { type: 'boolean', default: false },
+      'output-dir': { type: 'string' },
+    },
+  });
+
+  const command = positionals[0] ?? '';
+  let limit = null;
+  if (values.limit) {
+    limit = Number.parseInt(values.limit, 10);
+    if (!Number.isFinite(limit) || limit <= 0) {
+      throw new Error(`Invalid --limit value: "${values.limit}". Must be a positive integer.`);
+    }
+  }
+
+  return {
+    command,
+    config: values.config ?? 'config.json',
+    limit,
+    query: values.query ?? null,
+    discoveryOnly: Boolean(values['discovery-only']),
+    postUrl: values['post-url'] ?? null,
+    postId: values['post-id'] ?? null,
+    testSortSwitch: Boolean(values['test-sort-switch']),
+    fromDiscovery: values['from-discovery'] ?? null,
+    resume: Boolean(values.resume),
+    outputDir: values['output-dir'] ?? null,
+  };
+}
+
+export function resolveCollectionPostLimit(explicitLimit, configuredMaxPosts, candidateCount) {
+  if (Number.isFinite(explicitLimit) && explicitLimit > 0) return Math.min(explicitLimit, candidateCount);
+  const configured = Number(configuredMaxPosts);
+  if (Number.isFinite(configured) && configured > 0) return Math.min(Math.floor(configured), candidateCount);
+  return candidateCount;
+}
+
+async function loadConfig(configArg, cliQuery = null) {
+  const configPath = path.resolve(process.cwd(), configArg);
+  const parsed = JSON.parse(await fs.readFile(configPath, 'utf8'));
+  const baseDir = path.dirname(configPath);
+
+  if (!parsed.group?.id) throw new Error('config.group.id is required');
+  const queries = cliQuery ? [cliQuery] : parsed.queries;
+  if (!Array.isArray(queries) || queries.length === 0) throw new Error('config.queries must contain at least one query');
+
+  return {
+    ...parsed,
+    _configPath: configPath,
+    _baseDir: baseDir,
+    queries,
+    browser: {
+      headless: false,
+      profileDir: './profile',
+      locale: 'vi-VN',
+      ...parsed.browser,
+    },
+    pacing: {
+      minMs: 1200,
+      maxMs: 2600,
+      ...parsed.pacing,
+    },
+    discovery: {
+      safetyCapRounds: 150,
+      scrollPixels: 1400,
+      maxCandidatesPerQuery: 500,
+      ...parsed.discovery,
+    },
+    collection: {
+      maxPosts: 25,
+      expandRounds: 40,
+      maxClicksPerRound: 30,
+      outputDir: './output',
+      rawHtmlMaxChars: 2_000_000,
+      ...parsed.collection,
+    },
+    relevance: {
+      threshold: 5,
+      include: [],
+      exclude: [],
+      ...parsed.relevance,
+    },
+  };
+}
+
+function resolveConfigPath(config, value) {
+  return path.resolve(config._baseDir, value);
+}
+
+async function randomPause(config, multiplier = 1) {
+  const min = Math.max(0, Number(config.pacing.minMs ?? 1200));
+  const max = Math.max(min, Number(config.pacing.maxMs ?? 2600));
+  const ms = Math.round((min + Math.random() * (max - min)) * multiplier);
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function timestampSlug() {
+  return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+async function openContext(config) {
+  const profileDir = resolveConfigPath(config, config.browser.profileDir);
+  await fs.mkdir(profileDir, { recursive: true });
+  const context = await chromium.launchPersistentContext(profileDir, {
+    headless: Boolean(config.browser.headless),
+    locale: config.browser.locale ?? 'vi-VN',
+    viewport: config.browser.viewport ?? null,
+  });
+  const page = context.pages()[0] ?? (await context.newPage());
+  page.setDefaultTimeout(8_000);
+  return { context, page };
+}
+
+async function login(config) {
+  const { context, page } = await openContext(config);
+  try {
+    await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded' });
+    console.log(`Browser profile: ${resolveConfigPath(config, config.browser.profileDir)}`);
+    console.log('Log in to Facebook in the opened browser. Do not paste credentials into this tool.');
+    console.log('When the Facebook home/feed is usable, return here and press Enter.');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    await rl.question('Press Enter to save the browser session...');
+    rl.close();
+  } finally {
+    await context.close();
+  }
+}
+
+function searchUrl(groupId, query) {
+  return `https://www.facebook.com/groups/${encodeURIComponent(groupId)}/search/?q=${encodeURIComponent(query)}`;
+}
+
+async function extractDiscoveryCandidates(page, fallbackGroupId) {
+  return page.evaluate(({ fallbackGroupId }) => {
+    const links = [...document.querySelectorAll('a[href]')];
+    const out = [];
+    for (const link of links) {
+      const href = link.href;
+      if (!href || !href.includes('facebook.com/groups/')) continue;
+      if (!(href.includes('/posts/') || href.includes('/permalink/') || href.includes('multi_permalinks='))) continue;
+      const article = link.closest('[role="article"]');
+      const container = article ?? link.parentElement?.parentElement ?? link.parentElement;
+      const text = (container?.innerText ?? '').replace(/\s+/g, ' ').trim();
+      out.push({ href, preview: text.slice(0, 6000), fallbackGroupId });
+    }
+    return out;
+  }, { fallbackGroupId });
+}
+
+async function discover(page, config) {
+  const candidates = new Map();
+  const discoveryDiagnostics = [];
+
+  for (const query of config.queries) {
+    console.log(`\n[discover] query="${query}"`);
+    try {
+      await page.goto(searchUrl(config.group.id, query), { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    } catch {
+      await randomPause(config, 2);
+      await page.goto(searchUrl(config.group.id, query), { waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(() => {});
+    }
+    await randomPause(config, 1.5);
+
+    const safetyCapRounds = config.discovery.safetyCapRounds ?? 90;
+    const scrollPixels = config.discovery.scrollPixels ?? 1500;
+    const tolerance = 100;
+    let stableBottomRounds = 0;
+    let prevScrollHeight = 0;
+    let completionReason = '';
+    const roundLogs = [];
+
+    for (let round = 1; round <= safetyCapRounds; round += 1) {
+      const rows = await extractDiscoveryCandidates(page, config.group.id);
+      let newThisRound = 0;
+
+      for (const row of rows) {
+        const canonical = canonicalizeFacebookPostUrl(row.href, config.group.id);
+        if (!canonical) continue;
+        const existing = candidates.get(canonical.key);
+        if (!existing) {
+          candidates.set(canonical.key, {
+            ...canonical,
+            preview: normalizeWhitespace(row.preview),
+            queries: new Set([query]),
+            discoveredUrls: new Set([row.href]),
+          });
+          newThisRound += 1;
+        } else {
+          existing.queries.add(query);
+          existing.discoveredUrls.add(row.href);
+          if ((row.preview?.length ?? 0) > (existing.preview?.length ?? 0)) {
+            existing.preview = normalizeWhitespace(row.preview);
+          }
+        }
+      }
+
+      const metrics = await page.evaluate(() => {
+        const el = document.scrollingElement || document.body;
+        const scrollTop = window.scrollY || el.scrollTop || 0;
+        const scrollHeight = el.scrollHeight;
+        const clientHeight = window.innerHeight || el.clientHeight;
+        const remainingPx = Math.max(0, scrollHeight - (scrollTop + clientHeight));
+        return { scrollTop, scrollHeight, clientHeight, remainingPx };
+      });
+
+      const atBottom = metrics.remainingPx <= tolerance;
+      const heightIncreased = metrics.scrollHeight > prevScrollHeight + 20;
+
+      if (atBottom) {
+        if (newThisRound === 0 && !heightIncreased) {
+          stableBottomRounds += 1;
+        } else {
+          stableBottomRounds = 0;
+        }
+      } else {
+        stableBottomRounds = 0;
+      }
+
+      const queryCandidatesCount = [...candidates.values()].filter((item) => item.queries.has(query)).length;
+
+      const logEntry = {
+        round,
+        candidates: queryCandidatesCount,
+        newThisRound,
+        scrollTop: metrics.scrollTop,
+        scrollHeight: metrics.scrollHeight,
+        clientHeight: metrics.clientHeight,
+        remainingPx: metrics.remainingPx,
+        atBottom,
+        heightIncreased,
+        stableBottomRounds,
+      };
+      roundLogs.push(logEntry);
+
+      console.log(`round=${round} candidates=${queryCandidatesCount} new=${newThisRound} atBottom=${atBottom} remainingPx=${metrics.remainingPx} scrollHeight=${metrics.scrollHeight} stable=${stableBottomRounds}`);
+
+      if (stableBottomRounds >= 3) {
+        completionReason = 'bottom-stable';
+        break;
+      }
+
+      prevScrollHeight = metrics.scrollHeight;
+
+      // Incremental continuous scroll by scrollPixels (1400px)
+      await page.evaluate((step) => window.scrollBy(0, step), scrollPixels);
+
+      // Reactive wait: if at bottom, allow settle window (2500ms) for Facebook GraphQL lazy load
+      const settleTimeout = atBottom ? 2500 : 800;
+      await page.waitForFunction(
+        (prev) => {
+          const el = document.scrollingElement || document.body;
+          return el.scrollHeight > prev + 40;
+        },
+        metrics.scrollHeight,
+        { timeout: settleTimeout }
+      ).catch(() => {});
+    }
+
+    if (!completionReason) {
+      completionReason = 'safety-cap';
+    }
+
+    const queryCandidatesCount = [...candidates.values()].filter((item) => item.queries.has(query)).length;
+    const completeness = completionReason === 'bottom-stable' ? 'complete' : 'truncated';
+    console.log(`\n[discover] COMPLETE query="${query}" candidates=${queryCandidatesCount} reason=${completionReason} completeness=${completeness}`);
+
+    discoveryDiagnostics.push({
+      query,
+      candidatesCount: queryCandidatesCount,
+      totalRounds: roundLogs.length,
+      completionReason,
+      completeness,
+      truncationReason: completeness === 'truncated' ? 'safety-cap' : null,
+      lastMetrics: roundLogs[roundLogs.length - 1] ?? null,
+      roundLogs,
+    });
+  }
+
+  const rankedCandidates = [...candidates.values()].map((item) => ({
+    ...item,
+    queries: [...item.queries],
+    discoveredUrls: [...item.discoveredUrls],
+    relevance: scoreRelevance(item.preview, config.relevance),
+  }));
+
+  return { candidates: rankedCandidates, discoveryDiagnostics };
+}
+
+async function switchCommentSortToAllComments(page, surface, testSortSwitch = false) {
+  try {
+    if (!(await surface.isVisible().catch(() => false))) {
+      throw new Error('Verified root surface is no longer visible');
+    }
+
+    let findTrigger = await surface.evaluate((root) => {
+      const clickables = [...root.querySelectorAll('button, [role="button"], div[aria-haspopup="menu"], div[tabindex]')];
+      for (const el of clickables) {
+        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (/^(?:phù hợp nhất|most relevant|bình luận hàng đầu|top comments|mới nhất|newest)$/i.test(text)) {
+          return { found: true, text, isAll: false };
+        }
+        if (/^(?:tất cả bình luận|all comments)$/i.test(text)) {
+          return { found: true, text, isAll: true };
+        }
+      }
+      return { found: false, text: null, isAll: false };
+    });
+
+    if (!findTrigger.found) {
+      const articleCount = await surface.locator('[role="article"]').count().catch(() => 0);
+      if (articleCount === 0) {
+        console.log(`[sort] Post has 0 comments (no sort trigger or articles). Verified as not-applicable-no-comments.`);
+        return {
+          initial: 'no-comments',
+          final: 'no-comments',
+          switched: false,
+          verified: true,
+          reason: 'not-applicable-no-comments',
+        };
+      }
+      console.log(`[sort] Comment sort trigger not found on surface (${articleCount} visible articles). Defaulting to verified-default-all.`);
+      return {
+        initial: 'default-all-shown',
+        final: 'default-all-shown',
+        switched: false,
+        verified: true,
+        reason: 'no-sort-dropdown-present',
+      };
+    }
+
+    // If testSortSwitch is requested and we are already in All comments, reset to Phù hợp nhất first
+    if (testSortSwitch && findTrigger.isAll) {
+      console.log(`[sort] Resetting to "Phù hợp nhất" for live transition test...`);
+      const triggerLoc = surface.locator('div[role="button"][aria-haspopup="menu"], [role="button"], button').filter({
+        hasText: /phù hợp nhất|most relevant|tất cả bình luận|all comments|bình luận hàng đầu|top comments|mới nhất|newest/i,
+      }).first();
+      await triggerLoc.scrollIntoViewIfNeeded().catch(() => {});
+      await triggerLoc.click({ timeout: 5000 });
+      await page.waitForTimeout(1000);
+      const mostRelOpt = page.locator('[role="menuitem"], [role="menuitemradio"]').filter({
+        hasText: /phù hợp nhất|most relevant/i,
+      }).first();
+      if (await mostRelOpt.isVisible().catch(() => false)) {
+        await mostRelOpt.click({ timeout: 5000 });
+        await page.waitForTimeout(2500);
+        const recheckInitial = await surface.evaluate((root) => {
+          const clickables = [...root.querySelectorAll('button, [role="button"], div[aria-haspopup="menu"], div[tabindex]')];
+          for (const el of clickables) {
+            const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (/^(?:phù hợp nhất|most relevant|bình luận hàng đầu|top comments|mới nhất|newest)$/i.test(text)) {
+              return { found: true, text, isAll: false };
+            }
+          }
+          return null;
+        });
+        if (recheckInitial) findTrigger = recheckInitial;
+      }
+    }
+
+    if (findTrigger.isAll) {
+      console.log(`[sort] initial="${findTrigger.text}" (already in All comments mode) switched=false verified=true`);
+      return { initial: findTrigger.text, final: findTrigger.text, switched: false, verified: true };
+    }
+
+    console.log(`[sort] initial="${findTrigger.text}"`);
+
+    const triggerLocator = surface.locator('div[role="button"][aria-haspopup="menu"], [role="button"], button').filter({
+      hasText: /phù hợp nhất|most relevant|tất cả bình luận|all comments|bình luận hàng đầu|top comments|mới nhất|newest/i,
+    }).first();
+
+    await triggerLocator.scrollIntoViewIfNeeded().catch(() => {});
+    await triggerLocator.click({ timeout: 5000 });
+    console.log(`[sort] clicked trigger`);
+    await page.waitForTimeout(1000);
+
+    const menuOption = page.locator('[role="menuitem"], [role="menuitemradio"]').filter({
+      hasText: /tất cả bình luận|all comments/i,
+    });
+
+    const optionCount = await menuOption.count();
+    let clicked = false;
+    if (optionCount > 0) {
+      for (let i = 0; i < optionCount; i += 1) {
+        const opt = menuOption.nth(i);
+        if (await opt.isVisible().catch(() => false)) {
+          await opt.click({ timeout: 5000 });
+          clicked = true;
+          console.log(`[sort] clicked "Tất cả bình luận"`);
+          break;
+        }
+      }
+    }
+
+    if (clicked) {
+      // Re-check only the verified root's own surface. A different dialog
+      // displaying the same post id cannot confirm this transition.
+      const recheckText = await surface.evaluate((root) => {
+        const clickables = [...root.querySelectorAll('button, [role="button"], div[aria-haspopup="menu"], div[tabindex]')];
+        for (const el of clickables) {
+          const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (/^(?:tất cả bình luận|all comments|phù hợp nhất|most relevant|mới nhất|newest)$/i.test(text)) {
+            return text;
+          }
+        }
+        return null;
+      });
+
+      if (recheckText && /^(?:tất cả bình luận|all comments)$/i.test(recheckText)) {
+        console.log(`[sort] final="${recheckText}" switched=true verified=true`);
+        return {
+          initial: findTrigger.text,
+          final: recheckText,
+          switched: true,
+          verified: true,
+        };
+      } else if (recheckText) {
+        console.warn(`[sort] final="${recheckText}" switched=false verified=false (still in "${recheckText}")`);
+        return {
+          initial: findTrigger.text,
+          final: recheckText,
+          switched: false,
+          verified: false,
+        };
+      } else {
+        console.warn(`[sort] final="unverified" switched=false verified=false (recheck returned null)`);
+        return {
+          initial: findTrigger.text,
+          final: 'unverified',
+          switched: false,
+          verified: false,
+        };
+      }
+    }
+
+    console.warn(`[sort] Menu opened but "Tất cả bình luận" option was not clickable.`);
+    return { initial: findTrigger.text, final: findTrigger.text, switched: false, verified: false };
+  } catch (err) {
+    console.warn(`[sort] Failed to switch comment sort: ${err?.message ?? err}`);
+    return { initial: 'error', final: 'error', switched: false, verified: false, error: err?.message };
+  }
+}
+
+async function expandPost(page, strictSurface, config, testSortSwitch = false) {
+  const maxRounds = config.collection.expandRounds ?? 80;
+  const maxClicksPerRound = config.collection.maxClicksPerRound ?? 30;
+  const tolerance = 80;
+
+  // The caller resolved this surface from the one strict root article. Do not
+  // rediscover a dialog by post-id text, because comment/reply links carry it.
+  const commentSort = await switchCommentSortToAllComments(page, strictSurface, testSortSwitch);
+  const initInfo = await strictSurface.evaluate((surface) => ({
+    surfaceType: (surface.getAttribute('role') === 'dialog' || surface.getAttribute('aria-modal') === 'true') ? 'dialog' : 'main',
+  }));
+
+  let prevArticles = 0;
+  let prevScrollHeight = 0;
+  let bottomIdleRounds = 0;
+  let failedScrollAssertion = false;
+  let completionReason = '';
+  const roundLogs = [];
+  const clickedByLabel = {};
+  const initialWindowScrollY = await page.evaluate(() => window.scrollY);
+
+  for (let round = 1; round <= maxRounds; round += 1) {
+    const stepResult = await strictSurface.evaluate(async (surface, { maxClicksPerRound, expandRegexesSrc, tolerance, initialWindowScrollY }) => {
+      const EXPAND_REGEXES = expandRegexesSrc.map((src) => new RegExp(src, 'i'));
+      const isExpandText = (text) => EXPAND_REGEXES.some((re) => re.test(text));
+
+      const findScrollContainer = (root) => {
+        const candidates = [];
+        const elements = [root, ...root.querySelectorAll('*')];
+        for (const el of elements) {
+          const style = window.getComputedStyle(el);
+          const isScrollStyle = (style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 20;
+          const articleCount = el.querySelectorAll('[role="article"]').length;
+          if (isScrollStyle) {
+            candidates.push({
+              el,
+              reason: `overflow-${style.overflowY}-with-scrollDiff-${el.scrollHeight - el.clientHeight}`,
+              articleCount,
+              scrollHeight: el.scrollHeight,
+              clientHeight: el.clientHeight,
+            });
+          }
+        }
+        candidates.sort((a, b) => b.articleCount - a.articleCount || b.scrollHeight - a.scrollHeight);
+        return candidates[0] || {
+          el: root,
+          reason: 'surface-fallback',
+          articleCount: root.querySelectorAll('[role="article"]').length,
+          scrollHeight: root.scrollHeight,
+          clientHeight: root.clientHeight,
+        };
+      };
+
+      const scrollInfo = findScrollContainer(surface);
+      const container = scrollInfo.el;
+
+      const isVisible = (el) => {
+        const style = window.getComputedStyle(el);
+        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && (el.offsetWidth > 0 || el.offsetHeight > 0);
+      };
+
+      const prevScrollTop = container.scrollTop;
+      const clickedThisRound = [];
+
+      // Multi-pass expansion at current scroll position with reactive wait
+      let sweepPass = 0;
+      while (sweepPass < 4) {
+        sweepPass += 1;
+        const clickables = [...surface.querySelectorAll('button, a, [role="button"]')];
+        const eligible = clickables.filter((el) => {
+          if (!isVisible(el)) return false;
+          const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+          return isExpandText(text);
+        });
+
+        if (eligible.length === 0) break;
+        let clickedInPass = 0;
+        for (const btn of eligible) {
+          if (clickedThisRound.length >= maxClicksPerRound) break;
+          const text = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
+          try {
+            const startArticles = surface.querySelectorAll('[role="article"]').length;
+            const startHeight = container.scrollHeight;
+            btn.scrollIntoView({ block: 'nearest' });
+            btn.click();
+            clickedThisRound.push(text);
+            clickedInPass += 1;
+
+            // Reactive wait: wait for article increase, height change, or button disappearance
+            const startT = Date.now();
+            while (Date.now() - startT < 1200) {
+              await new Promise((r) => setTimeout(r, 60));
+              const currArt = surface.querySelectorAll('[role="article"]').length;
+              const currH = container.scrollHeight;
+              const btnDetached = !document.body.contains(btn) || !isVisible(btn);
+              if (currArt > startArticles || currH > startHeight + 20 || btnDetached) {
+                break;
+              }
+            }
+          } catch {}
+        }
+        if (clickedInPass === 0) break;
+      }
+
+      // Scroll container down
+      const scrollStep = Math.max(350, Math.round((container.clientHeight || 500) * 0.8));
+      container.scrollTop += scrollStep;
+
+      // Reactive scroll wait: wait until scrollHeight changes or settles
+      const scrollStartT = Date.now();
+      const scrollStartH = container.scrollHeight;
+      while (Date.now() - scrollStartT < 800) {
+        await new Promise((r) => setTimeout(r, 70));
+        if (container.scrollHeight > scrollStartH + 20) break;
+      }
+
+      const currentWindowScrollY = window.scrollY;
+      const scrollFailed = Math.abs(currentWindowScrollY - initialWindowScrollY) > 50 && container.scrollTop === prevScrollTop;
+
+      const currArticles = surface.querySelectorAll('[role="article"]').length;
+      const currScrollHeight = container.scrollHeight;
+      const clientHeight = container.clientHeight;
+      const maxScrollTop = Math.max(0, currScrollHeight - clientHeight);
+      const remainingPx = Math.max(0, currScrollHeight - (container.scrollTop + clientHeight));
+      const atBottom = remainingPx <= tolerance;
+
+      return {
+        scrollTop: container.scrollTop,
+        scrollHeight: currScrollHeight,
+        clientHeight,
+        maxScrollTop,
+        remainingPx,
+        atBottom,
+        visibleArticles: currArticles,
+        clickedTexts: clickedThisRound,
+        windowScrollY: currentWindowScrollY,
+        scrollFailed,
+        scrollContainerReason: scrollInfo.reason,
+      };
+    }, {
+      maxClicksPerRound,
+      expandRegexesSrc: EXPAND_REGEXES.map((re) => re.source),
+      tolerance,
+      initialWindowScrollY,
+    });
+
+    if (stepResult.scrollFailed) failedScrollAssertion = true;
+
+    for (const text of stepResult.clickedTexts) {
+      clickedByLabel[text] = (clickedByLabel[text] || 0) + 1;
+    }
+
+    const newBlocks = stepResult.visibleArticles > prevArticles;
+    const heightIncreased = stepResult.scrollHeight > prevScrollHeight + 20;
+
+    const roundData = {
+      round,
+      scrollTop: stepResult.scrollTop,
+      scrollHeight: stepResult.scrollHeight,
+      clientHeight: stepResult.clientHeight,
+      maxScrollTop: stepResult.maxScrollTop,
+      remainingPx: stepResult.remainingPx,
+      atBottom: stepResult.atBottom,
+      visibleArticles: stepResult.visibleArticles,
+      clickedCount: stepResult.clickedTexts.length,
+      clickedTexts: stepResult.clickedTexts.slice(0, 8),
+      newBlocksAppeared: newBlocks,
+      scrollHeightIncreased: heightIncreased,
+      windowScrollY: stepResult.windowScrollY,
+      scrollContainerReason: stepResult.scrollContainerReason,
+    };
+    roundLogs.push(roundData);
+
+    if (stepResult.atBottom) {
+      if (stepResult.clickedTexts.length === 0 && !newBlocks && !heightIncreased) {
+        // Settle window at bottom: wait up to 1500ms for delayed GraphQL lazy loading
+        const settleResult = await strictSurface.evaluate(async (surface, { prevArticles, prevHeight }) => {
+          const startedAt = Date.now();
+          while (Date.now() - startedAt < 1_500) {
+            if (
+              surface.querySelectorAll('[role="article"]').length > prevArticles
+              || surface.scrollHeight > prevHeight + 20
+            ) return true;
+            await new Promise((resolve) => setTimeout(resolve, 75));
+          }
+          return false;
+        }, { prevArticles, prevHeight: prevScrollHeight }).catch(() => null);
+
+        if (!settleResult) {
+          bottomIdleRounds += 1;
+        } else {
+          bottomIdleRounds = 0;
+        }
+      } else {
+        bottomIdleRounds = 0;
+      }
+    } else {
+      bottomIdleRounds = 0;
+    }
+
+    console.log(`[post] round=${round} comments=${stepResult.visibleArticles} new=${stepResult.visibleArticles - prevArticles} [scroll] scrollTop=${stepResult.scrollTop} scrollHeight=${stepResult.scrollHeight} remainingPx=${stepResult.remainingPx} atBottom=${stepResult.atBottom} [expand] clicked=${stepResult.clickedTexts.length} [stableBottom]=${bottomIdleRounds}`);
+
+    prevArticles = stepResult.visibleArticles;
+    prevScrollHeight = stepResult.scrollHeight;
+
+    if (bottomIdleRounds >= 3) {
+      completionReason = 'bottom-stable';
+      break;
+    }
+  }
+
+  if (!completionReason) {
+    completionReason = 'safety-cap';
+  }
+
+  const completeness = completionReason === 'bottom-stable' ? 'complete' : 'truncated';
+  console.log(`\n[post] COMPLETE comments=${prevArticles} reason=${completionReason} completeness=${completeness}`);
+
+  // Scan suspicious unmatched controls on the root-derived surface only.
+  const suspiciousUnmatched = await strictSurface.evaluate((surface, { expandRegexesSrc }) => {
+    const EXPAND_REGEXES = expandRegexesSrc.map((src) => new RegExp(src, 'i'));
+    const isExpandText = (text) => EXPAND_REGEXES.some((re) => re.test(text));
+    const isVisible = (el) => {
+      const style = window.getComputedStyle(el);
+      return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && (el.offsetWidth > 0 || el.offsetHeight > 0);
+    };
+    const allButtons = [...surface.querySelectorAll('button, a, [role="button"]')].filter(isVisible);
+    const suspicious = [];
+    for (const btn of allButtons) {
+      const text = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
+      if (text.length > 0 && text.length < 80 && !isExpandText(text)) {
+        const lower = text.toLowerCase();
+        if (['bình luận', 'phản hồi', 'câu trả lời', 'comment', 'reply', 'replies', 'xem thêm', 'see more'].some((k) => lower.includes(k))) {
+          if (!['bình luận', 'viết bình luận công khai…', 'viết phản hồi công khai…', 'tất cả bình luận', 'phù hợp nhất', 'all comments', 'most relevant'].includes(lower) && !/^\d+\s*bình luận$/i.test(text)) {
+            suspicious.push(text);
+          }
+        }
+      }
+    }
+    return suspicious;
+  }, { expandRegexesSrc: EXPAND_REGEXES.map((re) => re.source) });
+
+  return {
+    surfaceType: initInfo.surfaceType,
+    scrollContainerReason: roundLogs[0]?.scrollContainerReason ?? 'detected-container',
+    failedScrollAssertion,
+    commentSort,
+    totalRounds: roundLogs.length,
+    completionReason,
+    completeness,
+    truncationReason: completeness === 'truncated' ? 'safety-cap' : null,
+    finalArticles: prevArticles,
+    finalRemainingPx: roundLogs[roundLogs.length - 1]?.remainingPx ?? 0,
+    finalAtBottom: roundLogs[roundLogs.length - 1]?.atBottom ?? false,
+    clickedByLabel,
+    suspiciousUnmatched,
+    roundLogs,
+  };
+}
+
+async function extractPostBundle(page, postId, rawHtmlMaxChars, expansion = null, strictCapture = null, strictScope = null) {
+  const strictRootHandle = strictScope ? await strictScope.root.elementHandle() : null;
+  const strictSurfaceHandle = strictScope ? await strictScope.surface.elementHandle() : null;
+  if (strictScope && (!strictRootHandle || !strictSurfaceHandle)) {
+    await strictRootHandle?.dispose();
+    await strictSurfaceHandle?.dispose();
+    throw new Error(`Verified root surface disappeared before extraction for post ${postId}`);
+  }
+  try {
+    return await page.evaluate(({ postId, rawHtmlMaxChars, expansion, strictRootIdentity, strictRootNode, strictSurfaceNode }) => {
+    // 8. Extraction must use the same selected post surface
+    const strictRootMatches = (node) => {
+      const aria = (node.getAttribute('aria-label') || '').toLowerCase();
+      if (/\b(comment|reply|bình luận|phản hồi)\b/i.test(aria)) return false;
+      return [...node.querySelectorAll('a[href]')].some((anchor) => {
+      try {
+        const url = new URL(anchor.href, location.origin);
+        if (url.searchParams.has('comment_id') || url.searchParams.has('reply_comment_id')) return false;
+        const path = url.pathname.replace(/\/+$/, '');
+        const match = path.match(/^\/groups\/([^/]+)\/(?:posts|permalink)\/(\d+)$/i);
+        return match?.[1]?.toLowerCase() === strictRootIdentity.groupIdentifier.toLowerCase()
+          && match?.[2] === strictRootIdentity.postId;
+      } catch {
+        return false;
+      }
+      });
+    };
+    if (strictRootNode) {
+      if (!strictSurfaceNode || !document.contains(strictRootNode) || !document.contains(strictSurfaceNode) || !strictSurfaceNode.contains(strictRootNode)) {
+        throw new Error('Verified root/surface binding was lost before extraction');
+      }
+      if (!strictRootMatches(strictRootNode)) {
+        throw new Error('Verified root no longer satisfies the strict identity contract');
+      }
+    }
+    const visibleArticles = [...document.querySelectorAll('[role="article"]')].filter((node) => {
+      return Boolean(node.offsetWidth || node.offsetHeight || node.getClientRects().length);
+    });
+    const matchingStrictRoots = strictRootIdentity && !strictRootNode ? visibleArticles.filter(strictRootMatches) : [];
+    if (strictRootIdentity && !strictRootNode && matchingStrictRoots.length !== 1) {
+      throw new Error(`Expected one strict root article, found ${matchingStrictRoots.length}`);
+    }
+    const strictRoot = strictRootNode ?? matchingStrictRoots[0] ?? null;
+    const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
+    const matchingDialog = strictRoot ? strictRoot.closest('[role="dialog"], [aria-modal="true"]') : dialogs.find((d) => {
+      if (!d.offsetParent && d.offsetWidth === 0 && d.offsetHeight === 0) return false;
+      const text = d.innerText || '';
+      return text.includes(postId) || !!d.querySelector(`a[href*="${postId}"]`);
+    }) || dialogs.find((d) => {
+      return d.querySelectorAll('[role="article"]').length > 0 && (d.offsetHeight > 200 || (d.innerText || '').length > 200);
+    }) || null;
+
+    const strictMain = strictRoot?.closest('[role="main"], main') || null;
+    if (strictRoot && !strictSurfaceNode && !matchingDialog && !strictMain) {
+      throw new Error('Verified root has no dialog/main extraction surface');
+    }
+    const surface = strictRoot
+      ? (strictSurfaceNode || matchingDialog || strictMain)
+      : (matchingDialog || document.querySelector('[role="main"]') || document.querySelector('main') || document.body);
+    const surfaceType = (surface.getAttribute('role') === 'dialog' || surface.getAttribute('aria-modal') === 'true')
+      ? 'dialog'
+      : (surface.getAttribute('role') === 'main' || surface.tagName.toLowerCase() === 'main' ? 'main' : 'body');
+
+    // Scoped article blocks strictly within the detected post surface
+    const allArticles = [...surface.querySelectorAll('[role="article"]')];
+
+    // --- helpers ---
+
+    /** True when anchor points to canonical post permalink (not #, not comment_id) */
+    const isCanonicalPostAnchor = (a) => {
+      const rawHref = a.getAttribute('href') || '';
+      if (!rawHref || rawHref === '#' || rawHref.startsWith('#') || rawHref.startsWith('javascript:')) return false;
+      try {
+        const url = new URL(a.href, location.origin);
+        if (!/facebook\.com$/i.test(url.hostname)) return false;
+        if (url.searchParams.has('comment_id') || url.searchParams.has('reply_comment_id')) return false;
+        const path = url.pathname.replace(/\/+$/, '');
+        const isPostPath = path.endsWith(`/${postId}`) || path.includes(`/posts/${postId}`) || path.includes(`/permalink/${postId}`);
+        const isMultiPermalink = url.searchParams.get('multi_permalinks') === postId;
+        return isPostPath || isMultiPermalink;
+      } catch {
+        return false;
+      }
+    };
+
+    /** True when anchor is a comment/reply permalink */
+    const isCommentAnchor = (a) => {
+      const rawHref = a.getAttribute('href') || '';
+      if (!rawHref || rawHref.startsWith('#') || rawHref.startsWith('javascript:')) return false;
+      try {
+        const url = new URL(a.href, location.origin);
+        return (url.searchParams.has('comment_id') || url.searchParams.has('reply_comment_id')) && url.pathname.includes(postId);
+      } catch {
+        return false;
+      }
+    };
+
+    /** True when article has aria-label indicating it is a comment or reply */
+    const isCommentAriaLabel = (node) => {
+      const label = (node.getAttribute('aria-label') || '').toLowerCase();
+      return (
+        label.includes('bình luận') ||
+        label.includes('phản hồi') ||
+        label.includes('đáp lại') ||
+        label.includes('comment') ||
+        label.includes('reply') ||
+        label.includes('replied')
+      );
+    };
+
+    const directLinks = (node) => [...node.querySelectorAll('a[href]')]
+      .filter((a) => a.closest('[role="article"]') === node || node.getAttribute('role') !== 'article')
+      .map((a) => ({ text: (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim(), href: a.href }))
+      .filter((x) => x.text || x.href);
+
+    const ownText = (node) => {
+      const clone = node.cloneNode(true);
+      for (const nested of clone.querySelectorAll('[role="article"]')) nested.remove();
+      return (clone.textContent || '').replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+    };
+
+    const pickAuthor = (links) => {
+      const userLink = links.find((x) => x.text && /facebook\.com\/(?:groups\/[^/]+\/user\/\d+|profile\.php|[^/?#]+)(?:[/?#]|$)/i.test(x.href)
+        && !/facebook\.com\/groups\//i.test(x.href.replace(/\/groups\/[^/]+\/user\/\d+.*/, '')));
+      return userLink ?? links.find((x) => x.text && x.text.length <= 120) ?? null;
+    };
+
+    // --- score each article as a potential post root (for standalone pages) ---
+
+    const scored = allArticles.map((node) => {
+      const anchors = [...node.querySelectorAll('a[href]')];
+      const hasCanonicalLink = anchors.some(isCanonicalPostAnchor);
+      const hasCommentLinks = anchors.some(isCommentAnchor);
+      const isCommentByAria = isCommentAriaLabel(node);
+      const nestedArticleCount = node.querySelectorAll('[role="article"]').length;
+      const isTopLevel = !node.parentElement?.closest('[role="article"]');
+      const textLen = (node.innerText ?? '').length;
+
+      let score = 0;
+      const reasons = [];
+
+      if (isCommentByAria) {
+        score -= 200;
+        reasons.push('comment-aria-label');
+      }
+
+      if (hasCanonicalLink) {
+        score += 100;
+        reasons.push('has-canonical-post-link');
+      }
+
+      if (hasCommentLinks && !hasCanonicalLink) {
+        score -= 50;
+        reasons.push('has-only-comment-links');
+      }
+
+      if (!hasCanonicalLink && !hasCommentLinks) {
+        score -= 30;
+        reasons.push('no-post-links');
+      }
+
+      if (nestedArticleCount > 0) {
+        score += 30 * Math.min(nestedArticleCount, 5);
+        reasons.push(`contains-${nestedArticleCount}-nested-articles`);
+      }
+
+      if (isTopLevel) {
+        score += 10;
+        reasons.push('top-level');
+      }
+
+      // Tiebreaker: prefer longer content
+      score += Math.min(textLen / 1000, 20);
+
+      return {
+        node,
+        score,
+        reasons,
+        textPreview: (node.innerText ?? '').slice(0, 300),
+        hasCanonicalLink,
+        hasCommentLinks,
+        isCommentByAria,
+        nestedArticleCount,
+        isTopLevel,
+      };
+    });
+
+    let root = null;
+    let rootSelectionType = '';
+    let selectedScore = 0;
+    let selectedReasons = [];
+
+    const strictRoots = strictRoot ? [strictRoot] : [];
+
+    if (strictRoots.length === 1) {
+      root = strictRoots[0];
+      rootSelectionType = 'strict-verified-article';
+      selectedScore = 1000;
+      selectedReasons = ['strict-root-body-contract'];
+    } else if (surfaceType === 'dialog') {
+      root = surface;
+      rootSelectionType = 'dialog';
+      selectedScore = 150;
+      selectedReasons = ['permalink-modal-dialog'];
+    } else {
+      scored.sort((a, b) => b.score - a.score);
+      const bestCandidate = scored[0] && scored[0].score > 0 && !scored[0].isCommentByAria ? scored[0] : null;
+      root = bestCandidate?.node ?? surface;
+      rootSelectionType = bestCandidate ? 'scored-article' : 'fallback-main';
+      selectedScore = bestCandidate?.score ?? 0;
+      selectedReasons = bestCandidate?.reasons ?? ['fallback-main'];
+    }
+
+    // --- collect comments ---
+    // If root is dialog, comments are all role="article" elements inside dialog.
+    // If root is article, comments are all role="article" elements on page except root.
+    const commentNodes = root === surface && surfaceType === 'dialog'
+      ? allArticles
+      : allArticles.filter((article) => article !== root);
+
+    const indexByNode = new Map(commentNodes.map((node, index) => [node, index]));
+
+    const comments = commentNodes.map((node, index) => {
+      let parentArticle = node.parentElement?.closest('[role="article"]') ?? null;
+      while (parentArticle && parentArticle !== root && !indexByNode.has(parentArticle)) {
+        parentArticle = parentArticle.parentElement?.closest('[role="article"]') ?? null;
+      }
+      const parentIndex = parentArticle && parentArticle !== root ? indexByNode.get(parentArticle) ?? null : null;
+
+      // Determine nesting depth relative to root
+      let depth = 0;
+      let cursor = node.parentElement?.closest('[role="article"]') ?? null;
+      while (cursor && cursor !== root) {
+        depth += 1;
+        cursor = cursor.parentElement?.closest('[role="article"]') ?? null;
+      }
+      if (!root.contains(node)) depth = 0;
+
+      const links = directLinks(node);
+      const author = pickAuthor(links);
+      const commentLink = links.find((x) => /[?&](?:comment_id|reply_comment_id)=\d+/i.test(x.href)) ?? null;
+      const isNested = root.contains(node);
+
+      return {
+        index,
+        parentIndex,
+        depth,
+        author: author?.text ?? null,
+        authorUrl: author?.href ?? null,
+        rawText: ownText(node),
+        links,
+        sourceUrl: commentLink?.href ?? null,
+        hierarchySource: isNested ? 'nested' : 'sibling',
+      };
+    });
+
+    const rootLinks = directLinks(root);
+    const rootAuthor = pickAuthor(rootLinks);
+    const html = root.outerHTML ?? '';
+
+    // Diagnostic: top article candidates (bounded)
+    const articleCandidates = scored.slice(0, 15).map((c) => ({
+      score: c.score,
+      reasons: c.reasons,
+      textPreview: c.textPreview,
+      hasCanonicalLink: c.hasCanonicalLink,
+      hasCommentLinks: c.hasCommentLinks,
+      isCommentByAria: c.isCommentByAria,
+      nestedArticleCount: c.nestedArticleCount,
+      isTopLevel: c.isTopLevel,
+    }));
+
+    return {
+      pageUrl: location.href,
+      rootFoundByPostLink: Boolean(strictRootIdentity) || rootSelectionType === 'dialog' || (scored[0]?.hasCanonicalLink ?? false),
+      rootSelection: {
+        type: rootSelectionType,
+        candidateCount: allArticles.length,
+        selectedScore,
+        selectedReasons,
+        articleCandidates,
+      },
+      expansion: expansion ?? null,
+      post: {
+        author: rootAuthor?.text ?? null,
+        authorUrl: rootAuthor?.href ?? null,
+        rawText: ownText(root),
+        links: rootLinks,
+      },
+      comments,
+      raw: {
+        text: root.innerText ?? root.textContent ?? '',
+        html: html.slice(0, rawHtmlMaxChars),
+        htmlTruncated: html.length > rawHtmlMaxChars,
+      },
+    };
+    }, {
+      postId,
+      rawHtmlMaxChars,
+      expansion,
+      strictRootIdentity: strictCapture?.identity ?? null,
+      strictRootNode: strictRootHandle,
+      strictSurfaceNode: strictSurfaceHandle,
+    });
+  } finally {
+    await strictRootHandle?.dispose();
+    await strictSurfaceHandle?.dispose();
+  }
+}
+
+export const ACCEPTANCE_VERSION = DEEP_COLLECTION_ACCEPTANCE_VERSION;
+const LEGACY_ACCEPTANCE_VERSION = 'legacy-unverified-deep-collection-v0';
+
+function normalizeBundle(candidate, bundle, config, strictCapture = null) {
+  const postText = strictCapture?.body || cleanFacebookPostText(bundle.post.rawText, bundle.post.author ?? '') ||
+    cleanFacebookPostText(candidate.preview ?? '', bundle.post.author ?? '');
+  const comments = [];
+  const fingerprints = new Map();
+
+  for (const item of bundle.comments) {
+    const parentFingerprint = item.parentIndex == null ? '' : fingerprints.get(item.parentIndex) ?? '';
+    const text = cleanFacebookText(item.rawText, item.author ?? '');
+    if (!text || text.length < 2) continue;
+    const fingerprint = fingerprintComment({ postKey: candidate.key, author: item.author ?? '', text, parentFingerprint });
+    fingerprints.set(item.index, fingerprint);
+    comments.push({
+      fingerprint,
+      parentFingerprint: parentFingerprint || null,
+      depth: item.depth,
+      author: item.author,
+      authorUrl: item.authorUrl,
+      text,
+      rawText: item.rawText,
+      sourceUrl: item.sourceUrl,
+      links: item.links,
+    });
+  }
+
+  return {
+    schemaVersion: 1,
+    source: {
+      platform: 'facebook',
+      groupId: strictCapture?.identity?.groupIdentifier ?? candidate.groupId,
+      groupIdentifier: strictCapture?.identity?.groupIdentifier ?? candidate.groupIdentifier ?? candidate.groupId,
+      groupName: config.group.name ?? null,
+      postId: candidate.postId,
+      canonicalUrl: strictCapture?.identity?.canonicalUrl ?? candidate.canonicalUrl,
+      key: strictCapture?.identity?.key ?? candidate.key,
+      discoveryQueries: candidate.queries,
+      discoveredUrls: candidate.discoveredUrls,
+    },
+    capturedAt: new Date().toISOString(),
+    relevance: candidate.relevance,
+    post: {
+      author: bundle.post.author,
+      authorUrl: bundle.post.authorUrl,
+      text: postText,
+      discoveryPreview: candidate.preview,
+      rawText: bundle.post.rawText,
+      links: bundle.post.links,
+    },
+    comments: uniqueBy(comments, (item) => item.fingerprint),
+    extraction: {
+      acceptanceVersion: strictCapture ? ACCEPTANCE_VERSION : LEGACY_ACCEPTANCE_VERSION,
+      bodyAcceptanceVersion: strictCapture?.validation?.acceptanceVersion ?? null,
+      bodyContentHash: strictCapture ? hashText(postText) : null,
+      rootValidation: strictCapture?.validation ?? null,
+      rootFoundByPostLink: bundle.rootFoundByPostLink,
+      rootSelection: bundle.rootSelection ?? null,
+      expansion: bundle.expansion ?? null,
+      pageUrl: bundle.pageUrl,
+      completeness: 'best-effort; Facebook ranking, privacy, lazy loading, deleted content and UI changes can hide comments',
+    },
+  };
+}
+
+function toMarkdown(record) {
+  const lines = [
+    `# Facebook post ${record.source.postId}`,
+    '',
+    `- Group: ${record.source.groupName ?? record.source.groupId}`,
+    `- URL: ${record.source.canonicalUrl}`,
+    `- Captured: ${record.capturedAt}`,
+    `- Relevance score: ${record.relevance.score} (threshold ${record.relevance.threshold})`,
+    '',
+    '## Post',
+    '',
+    `**${record.post.author ?? 'Unknown author'}**`,
+    '',
+    record.post.text || record.post.discoveryPreview || '_No post text extracted._',
+    '',
+    '## Comments',
+    '',
+  ];
+
+  if (record.comments.length === 0) lines.push('_No comment blocks extracted._');
+  for (const comment of record.comments) {
+    const indent = '  '.repeat(Math.min(comment.depth, 6));
+    lines.push(`${indent}- **${comment.author ?? 'Unknown'}:** ${comment.text.replace(/\n/g, ' ')}`);
+  }
+  lines.push('');
+  return lines.join('\n');
+}
+
+async function fileExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function assertReviewedBodyIsCurrent(candidate, capture) {
+  const expected = candidate?.strictBody;
+  if (!expected) return;
+  if (expected.bodyAcceptanceVersion !== ROOT_BODY_ACCEPTANCE_VERSION) {
+    throw new Error(`Candidate ${candidate.postId} has an unsupported reviewed-body acceptance version`);
+  }
+  if (!expected.bodyContentHash || hashText(capture.body) !== expected.bodyContentHash) {
+    const error = new Error(`Verified root body changed after review for post ${candidate.postId}`);
+    error.code = 'REVIEWED_BODY_CHANGED';
+    throw error;
+  }
+}
+
+async function collect(config, options = {}) {
+  let runDir = null;
+  if (options.outputDir) {
+    runDir = path.resolve(process.cwd(), options.outputDir);
+  } else if (options.resume && options.fromDiscovery) {
+    const stat = await fs.stat(path.resolve(process.cwd(), options.fromDiscovery)).catch(() => null);
+    if (stat?.isDirectory()) {
+      runDir = path.resolve(process.cwd(), options.fromDiscovery);
+    }
+  }
+  if (!runDir) {
+    runDir = resolveConfigPath(config, path.join(config.collection.outputDir, timestampSlug()));
+  }
+
+  const rawDir = path.join(runDir, 'raw');
+  const normalizedDir = path.join(runDir, 'normalized');
+  await fs.mkdir(rawDir, { recursive: true });
+  await fs.mkdir(normalizedDir, { recursive: true });
+
+  const runJsonPath = path.join(runDir, 'RUN.json');
+  const startedAt = new Date().toISOString();
+  let currentStage = 'init';
+
+  /** Persist current run status to RUN.json */
+  const writeRunStatus = async (fields) => {
+    await atomicWriteJson(runJsonPath, {
+      startedFromConfig: config._configPath,
+      startedAt,
+      group: config.group,
+      queries: config.queries,
+      options: {
+        query: options.query ?? null,
+        discoveryOnly: Boolean(options.discoveryOnly),
+        postUrl: options.postUrl ?? null,
+        postId: options.postId ?? null,
+        limit: options.limit ?? null,
+        fromDiscovery: options.fromDiscovery ?? null,
+        resume: Boolean(options.resume),
+      },
+      note: 'Local research evidence. Do not commit raw Facebook dumps or browser profile data.',
+      ...fields,
+    });
+  };
+
+  await writeRunStatus({ status: 'running', stage: currentStage });
+
+  const { context, page } = await openContext(config);
+  const collected = [];
+  try {
+    // Mode 3: Direct Post Mode (Bypasses discovery completely)
+    if (options.postUrl || options.postId) {
+      currentStage = 'direct-post';
+      await writeRunStatus({ status: 'running', stage: currentStage });
+
+      let candidate = null;
+      if (options.postUrl) {
+        const canonical = canonicalizeFacebookPostUrl(options.postUrl, config.group.id);
+        if (!canonical) throw new Error(`Invalid Facebook post URL: "${options.postUrl}"`);
+        candidate = {
+          ...canonical,
+          preview: '',
+          queries: options.query ? [options.query] : [],
+          discoveredUrls: [options.postUrl],
+          relevance: { score: 10, matched: [], threshold: 5, relevant: true },
+        };
+      } else {
+        const canonicalUrl = `https://www.facebook.com/groups/${config.group.id}/permalink/${options.postId}/`;
+        candidate = {
+          groupId: config.group.id,
+          postId: options.postId,
+          canonicalUrl,
+          key: `facebook:${config.group.id}:${options.postId}`,
+          preview: '',
+          queries: options.query ? [options.query] : [],
+          discoveredUrls: [canonicalUrl],
+          relevance: { score: 10, matched: [], threshold: 5, relevant: true },
+        };
+      }
+
+      console.log(`\n[direct-post] Bypassing discovery. Opening target post: ${candidate.canonicalUrl}`);
+      await page.goto(candidate.canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+      const expansion = await expandPost(page, candidate.postId, config, options.testSortSwitch);
+      const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars, expansion);
+      const normalized = normalizeBundle(candidate, bundle, config);
+
+      await atomicWriteJson(path.join(rawDir, `${candidate.postId}.json`), {
+        source: candidate,
+        capturedAt: normalized.capturedAt,
+        pageUrl: bundle.pageUrl,
+        rootSelection: bundle.rootSelection ?? null,
+        expansion: bundle.expansion ?? null,
+        raw: bundle.raw,
+      });
+      await atomicWriteJson(path.join(normalizedDir, `${candidate.postId}.json`), normalized);
+      await atomicWriteFile(path.join(normalizedDir, `${candidate.postId}.md`), toMarkdown(normalized));
+      collected.push(normalized);
+
+      await atomicWriteJson(path.join(runDir, 'dataset.json'), collected);
+      await writeRunStatus({
+        status: 'completed',
+        completedAt: new Date().toISOString(),
+        stage: 'done',
+        records: 1,
+        mode: 'direct-post',
+      });
+
+      console.log(`\n[direct-post] Complete. Saved 1 post to: ${runDir}`);
+      return;
+    }
+
+    // Mode 1 & Mode 2: Search Discovery or Load from Discovery File
+    let candidates = null;
+    let discoveryDiagnostics = [];
+    let ranked = null;
+
+    if (options.fromDiscovery) {
+      let discoveryPath = path.resolve(process.cwd(), options.fromDiscovery);
+      const stat = await fs.stat(discoveryPath).catch(() => null);
+      if (stat?.isDirectory()) {
+        discoveryPath = path.join(discoveryPath, 'discovery.json');
+      }
+      console.log(`\n[from-discovery] Loading discovered candidates from: ${discoveryPath}`);
+      const discoveryData = JSON.parse(await fs.readFile(discoveryPath, 'utf8'));
+      const rawCandidates = discoveryData.candidates || [];
+      candidates = rawCandidates.map((c) => ({
+        ...c,
+        relevance: scoreRelevance(c.preview, config.relevance),
+      }));
+      discoveryDiagnostics = discoveryData.discoveryDiagnostics || [];
+      // Rank by relevance score, but KEEP all candidates
+      ranked = [...candidates].sort((a, b) => b.relevance.score - a.relevance.score || b.preview.length - a.preview.length);
+      const relevantCount = candidates.filter((c) => c.relevance?.relevant).length;
+      console.log(`[from-discovery] Loaded ${candidates.length} candidates (${relevantCount} keyword-matched score >= ${config.relevance.threshold}).`);
+      await atomicWriteJson(path.join(runDir, 'discovery.json'), {
+        group: config.group,
+        queries: config.queries,
+        candidateCount: candidates.length,
+        relevantCount,
+        discoveryDiagnostics,
+        candidates,
+      });
+    } else {
+      currentStage = 'discovery';
+      await writeRunStatus({ status: 'running', stage: currentStage });
+
+      const discResult = await discover(page, config);
+      candidates = discResult.candidates;
+      discoveryDiagnostics = discResult.discoveryDiagnostics;
+      // Rank by relevance score, but KEEP all candidates
+      ranked = [...candidates].sort((a, b) => b.relevance.score - a.relevance.score || b.preview.length - a.preview.length);
+      const relevantCount = candidates.filter((c) => c.relevance?.relevant).length;
+
+      await atomicWriteJson(path.join(runDir, 'discovery.json'), {
+        group: config.group,
+        queries: config.queries,
+        candidateCount: candidates.length,
+        relevantCount,
+        discoveryDiagnostics,
+        candidates: candidates.map((item) => ({ ...item, relevance: item.relevance })),
+      });
+    }
+
+    // Mode 2: Discovery Only
+    if (options.discoveryOnly) {
+      const relevantCount = candidates.filter((c) => c.relevance?.relevant).length;
+      await writeRunStatus({
+        status: 'completed',
+        completedAt: new Date().toISOString(),
+        stage: 'discovery-complete',
+        records: 0,
+        candidateCount: candidates.length,
+        relevantCount,
+        mode: 'discovery-only',
+      });
+      console.log(`\n[discovery-only] Complete. Discovered: ${candidates.length} candidates (keyword-matched: ${relevantCount}). Local output: ${runDir}`);
+      return;
+    }
+
+    // Default runs honor the configured safety budget. --limit is an explicit
+    // operator override for a deliberately bounded live validation.
+    const maxPosts = resolveCollectionPostLimit(options.limit, config.collection.maxPosts, ranked.length);
+    const selected = ranked.slice(0, maxPosts);
+
+    console.log(`\n[select] ${candidates.length} discovered candidates, attempting collection for ${selected.length} posts`);
+
+    currentStage = 'collection';
+    await writeRunStatus({ status: 'running', stage: currentStage, selectedCount: selected.length });
+
+    const postOutcomes = [];
+
+    for (let i = 0; i < selected.length; i += 1) {
+      const candidate = selected[i];
+      const normPath = path.join(normalizedDir, `${candidate.postId}.json`);
+      const rawPath = path.join(rawDir, `${candidate.postId}.json`);
+
+      // Strict Resume check: verifies version and all strict completeness invariants
+      if (options.resume && (await fileExists(normPath)) && (await fileExists(rawPath))) {
+        try {
+          const existingNorm = JSON.parse(await fs.readFile(normPath, 'utf8'));
+          const existingRaw = JSON.parse(await fs.readFile(rawPath, 'utf8'));
+          const exp = existingRaw?.expansion;
+          const extraction = existingNorm?.extraction;
+
+          const isStrictComplete =
+            existingNorm?.schemaVersion &&
+            Array.isArray(existingNorm?.comments) &&
+            extraction?.acceptanceVersion === ACCEPTANCE_VERSION &&
+            extraction?.bodyAcceptanceVersion === ROOT_BODY_ACCEPTANCE_VERSION &&
+            extraction?.rootValidation?.rootIdentityVerified === true &&
+            exp?.completeness === 'complete' &&
+            exp?.commentSort?.verified === true &&
+            exp?.failedScrollAssertion === false &&
+            (exp?.suspiciousUnmatched?.length ?? 0) === 0;
+
+          if (isStrictComplete) {
+            console.log(`[resume ${i + 1}/${selected.length}] Skipping verified complete post ${candidate.postId} (${candidate.canonicalUrl}).`);
+            collected.push(existingNorm);
+            postOutcomes.push({
+              postId: candidate.postId,
+              url: candidate.canonicalUrl,
+              author: existingNorm.post?.author ?? 'Unknown',
+              commentsCount: existingNorm.comments.length,
+              status: 'complete',
+              completionReason: exp?.completionReason ?? 'resumed',
+              truncationReason: null,
+              resumed: true,
+            });
+            continue;
+          } else {
+            console.log(`[resume ${i + 1}/${selected.length}] Existing post ${candidate.postId} lacks strict acceptance verification (version=${extraction?.acceptanceVersion}). Re-collecting...`);
+          }
+        } catch {}
+      }
+
+      console.log(`\n[collect ${i + 1}/${selected.length}] ${candidate.canonicalUrl} score=${candidate.relevance.score}`);
+
+      let attempt = 0;
+      let postSuccess = false;
+      let lastError = null;
+      let outcomeData = null;
+
+      while (attempt < 2 && !postSuccess) {
+        attempt += 1;
+        try {
+          let strictCapture = null;
+          let strictSurface = null;
+          let strictScope = null;
+          if (candidate.strictBody) {
+            strictCapture = await captureStrictRootBody(page, candidate, {
+              allowedGroupIdentifiers: candidate.allowedGroupIdentifiers ?? [],
+            });
+            assertReviewedBodyIsCurrent(candidate, strictCapture);
+            strictScope = await resolveStrictRootSurface(page, strictCapture.validation);
+            strictCapture.root = strictScope.root;
+            strictCapture.surfaceType = strictScope.surfaceType;
+            strictSurface = strictScope.surface;
+            candidate.groupId = strictCapture.identity.groupIdentifier;
+            candidate.groupIdentifier = strictCapture.identity.groupIdentifier;
+            candidate.canonicalUrl = strictCapture.identity.canonicalUrl;
+            candidate.key = strictCapture.identity.key;
+            candidate.corpusKey = strictCapture.identity.key;
+          } else {
+            await page.goto(candidate.canonicalUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+          }
+          // Direct legacy/debug invocation may still inspect a page, but it is
+          // stamped legacy-unverified and can never establish reusable
+          // evidence. The default v2 path always supplies strictSurface.
+          const expansion = await expandPost(page, strictSurface ?? page.locator('body'), config, options.testSortSwitch);
+          if (strictCapture) {
+            // Comment expansion can re-render the post surface. Re-resolve the
+            // exact root contract immediately before extracting comments; if it
+            // is no longer unique, fail/retry instead of reading another UI.
+            strictScope = await resolveStrictRootSurface(page, strictCapture.validation);
+            strictCapture.root = strictScope.root;
+          }
+          const bundle = await extractPostBundle(page, candidate.postId, config.collection.rawHtmlMaxChars, expansion, strictCapture, strictScope);
+          const normalized = normalizeBundle(candidate, bundle, config, strictCapture);
+
+          await atomicWriteJson(path.join(rawDir, `${candidate.postId}.json`), {
+            source: candidate,
+            capturedAt: normalized.capturedAt,
+            pageUrl: bundle.pageUrl,
+            rootSelection: bundle.rootSelection ?? null,
+            expansion: bundle.expansion ?? null,
+            raw: bundle.raw,
+            strictRootValidation: strictCapture?.validation ?? null,
+          });
+          await atomicWriteJson(path.join(normalizedDir, `${candidate.postId}.json`), normalized);
+          await atomicWriteFile(path.join(normalizedDir, `${candidate.postId}.md`), toMarkdown(normalized));
+          collected.push(normalized);
+
+          const isStrictComplete =
+            expansion.completeness === 'complete' &&
+            expansion.commentSort?.verified === true &&
+            expansion.failedScrollAssertion === false &&
+            (expansion.suspiciousUnmatched?.length ?? 0) === 0;
+
+          let postStatus = 'complete';
+          let postTruncationReason = null;
+
+          if (!isStrictComplete) {
+            postStatus = 'truncated';
+            if (expansion.completeness === 'truncated') {
+              postTruncationReason = expansion.truncationReason || 'safety-cap';
+            } else if (expansion.commentSort?.verified !== true) {
+              postTruncationReason = 'unverified-sort';
+            } else if (expansion.failedScrollAssertion) {
+              postTruncationReason = 'failed-scroll-assertion';
+            } else if ((expansion.suspiciousUnmatched?.length ?? 0) > 0) {
+              postTruncationReason = `suspicious-unmatched: ${expansion.suspiciousUnmatched.join(', ')}`;
+            } else {
+              postTruncationReason = 'incomplete-convergence';
+            }
+          }
+
+          outcomeData = {
+            postId: candidate.postId,
+            sourceKey: normalized.source.key,
+            url: candidate.canonicalUrl,
+            author: normalized.post.author ?? 'Unknown',
+            commentsCount: normalized.comments.length,
+            status: postStatus,
+            completionReason: expansion.completionReason,
+            truncationReason: postTruncationReason,
+          };
+          postSuccess = true;
+        } catch (err) {
+          lastError = err;
+          if (attempt < 2) {
+            console.warn(`[retry 1/1] Post ${candidate.postId} encountered error: ${err?.message ?? err}. Retrying in 2s...`);
+            await new Promise((r) => setTimeout(r, 2000));
+          }
+        }
+      }
+
+      if (!postSuccess) {
+        console.error(`[failed] Post ${candidate.postId} failed after ${attempt} attempts: ${lastError?.message ?? lastError}`);
+        outcomeData = {
+          postId: candidate.postId,
+          url: candidate.canonicalUrl,
+          author: null,
+          commentsCount: 0,
+          status: 'failed',
+          error: lastError?.message ?? String(lastError),
+        };
+      }
+
+      postOutcomes.push(outcomeData);
+    }
+
+    const completeCount = postOutcomes.filter((o) => o.status === 'complete').length;
+    const truncatedCount = postOutcomes.filter((o) => o.status === 'truncated').length;
+    const failedCount = postOutcomes.filter((o) => o.status === 'failed').length;
+    const skippedCount = Math.max(0, ranked.length - selected.length);
+    const incompletePosts = postOutcomes.filter((o) => o.status !== 'complete');
+
+    const reconciliation = {
+      topic: options.query ?? (config.queries.length === 1 ? config.queries[0] : 'all'),
+      discovered: candidates.length,
+      relevant: candidates.filter((c) => c.relevance?.relevant).length,
+      attempted: selected.length,
+      complete: completeCount,
+      truncated: truncatedCount,
+      failed: failedCount,
+      skipped: skippedCount,
+      incompletePosts,
+      postOutcomes,
+    };
+
+    await atomicWriteJson(path.join(runDir, 'reconciliation.json'), reconciliation);
+    await atomicWriteJson(path.join(runDir, 'dataset.json'), collected);
+
+    console.log(`\n==================================================`);
+    console.log(`TOPIC RECONCILIATION: "${reconciliation.topic}"`);
+    console.log(`==================================================`);
+    console.log(`Discovered:  ${reconciliation.discovered}`);
+    console.log(`Relevant:    ${reconciliation.relevant}`);
+    console.log(`Attempted:   ${reconciliation.attempted}`);
+    console.log(`Complete:    ${reconciliation.complete}`);
+    console.log(`Truncated:   ${reconciliation.truncated}`);
+    console.log(`Failed:      ${reconciliation.failed}`);
+    console.log(`Skipped:     ${reconciliation.skipped}`);
+    if (incompletePosts.length > 0) {
+      console.log(`\nIncomplete posts:`);
+      for (const p of incompletePosts) {
+        console.log(`- ${p.postId} (${p.url}): ${p.status} - ${p.truncationReason || p.error || p.completionReason}`);
+      }
+    }
+    console.log(`==================================================\n`);
+
+    await writeRunStatus({
+      status: failedCount > 0 ? 'completed-with-errors' : 'completed',
+      completedAt: new Date().toISOString(),
+      stage: 'done',
+      records: collected.length,
+      reconciliation,
+      mode: 'discovery-and-collect',
+    });
+
+    console.log(`Done. Local output: ${runDir}`);
+  } catch (err) {
+    await writeRunStatus({
+      status: 'failed',
+      failedAt: new Date().toISOString(),
+      stage: currentStage,
+      records: collected.length,
+      error: {
+        name: err?.name ?? 'Error',
+        message: err?.message ?? String(err),
+        // Only include stack in local diagnostics; RUN.json is .gitignored
+        stack: err?.stack ?? null,
+      },
+    }).catch(() => { /* best effort */ });
+    throw err;
+  } finally {
+    await context.close();
+  }
+}
+
+async function main() {
+  const cli = parseCli(process.argv.slice(2));
+  if (!['login', 'collect'].includes(cli.command)) {
+    console.error('Usage: node src/index.mjs <login|collect> [--config config.json] [--limit N] [--query "topic"] [--discovery-only] [--post-url <url>] [--post-id <id>]');
+    process.exitCode = 2;
+    return;
+  }
+
+  const config = await loadConfig(cli.config, cli.query);
+  if (cli.command === 'login') await login(config);
+  else await collect(config, cli);
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  main().catch((error) => {
+    console.error(error?.stack ?? error);
+    process.exitCode = 1;
+  });
+}

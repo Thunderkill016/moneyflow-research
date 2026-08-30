@@ -50,6 +50,14 @@ For each source record:
 | https://diataxis.fr/ | primary methodology | Separate tutorial/how-to/reference/explanation needs; improve knowledge navigation | Do not force taxonomy when research records need evidence-centric structure |
 | https://learn.microsoft.com/en-us/azure/well-architected/architect-role/architecture-decision-record | official practitioner guidance | Decision context, alternatives, consequences, confidence/status | Research decisions here do not replace MoneyFlow product/architecture authority |
 
+## Research collection tooling
+
+| Source | Type | Use | Limits / refresh |
+|---|---|---|---|
+| https://playwright.dev/docs/locators | official | Resilient browser-research locator strategy; prefer user-facing role/text contracts over brittle DOM chains | Does not guarantee stability/completeness on third-party sites; refresh on major Playwright changes |
+| https://www.npmjs.com/package/playwright | primary package registry | Current Playwright package/version/license check for research tooling | Package availability does not authorize automation against a specific service; refresh before dependency upgrades |
+| https://www.facebook.com/help/463983701520800 | official platform help | Meta definition of scraping and anti-scraping/rate/data-limit behavior; informs collection boundaries | Does not grant scraping permission; refresh when Meta platform/terms policy changes |
+
 ## Adding a source
 
 A reusable source entry should answer:

@@ -61,11 +61,17 @@ moneyflow-research/
 │   └── SOURCE_LEDGER.md
 ├── decisions/
 │   └── README.md
-└── templates/
-    ├── RESEARCH_RECORD.md
-    ├── TRADE_STUDY.md
-    └── EXPERIMENT_RECORD.md
+├── templates/
+│   ├── RESEARCH_RECORD.md
+│   ├── TRADE_STUDY.md
+│   └── EXPERIMENT_RECORD.md
+└── tools/
+    └── facebook-research-collector/
 ```
+
+## Research tooling
+
+[`tools/facebook-research-collector/`](./tools/facebook-research-collector/) is a bounded, browser-assisted collector for reducing manual copy/paste when studying Facebook community posts. It keeps browser state and collected source material local/gitignored; it is not a production MoneyFlow ingestion path and must not be used to bypass Facebook access controls or anti-automation measures.
 
 ## Core research rule
 
